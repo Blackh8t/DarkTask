@@ -1,0 +1,12 @@
+# Initial TURN relay template. Replace domain, external-ip and credentials.
+listening-port=3478
+tls-listening-port=5349
+fingerprint
+use-auth-secret
+static-auth-secret=CHANGE_ME
+realm=remote.example.com
+no-multicast-peers
+no-loopback-peers
+stale-nonce
+# cert=/etc/letsencrypt/live/remote.example.com/fullchain.pem
+# pkey=/etc/letsencrypt/live/remote.example.com/privkey.pem

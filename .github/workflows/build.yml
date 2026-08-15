@@ -1,0 +1,33 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux-server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build Linux server
+        run: cargo build --release -p remote-server
+      - uses: actions/upload-artifact@v4
+        with:
+          name: remote-server-linux-x86_64
+          path: target/release/remote-server
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build Windows agent and controller
+        run: cargo build --release -p remote-agent -p remote-controller
+      - uses: actions/upload-artifact@v4
+        with:
+          name: remote-windows-x86_64
+          path: |
+            target/release/remote-agent.exe
+            target/release/remote-controller.exe

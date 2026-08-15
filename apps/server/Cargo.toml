@@ -1,0 +1,22 @@
+[package]
+name = "remote-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+dashmap.workspace = true
+futures-util.workspace = true
+remote-protocol = { path = "../../crates/protocol" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+rusqlite.workspace = true
+sha2.workspace = true
+hex.workspace = true

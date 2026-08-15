@@ -1,0 +1,12 @@
+services:
+  server:
+    build:
+      context: ..
+      dockerfile: infra/server.Dockerfile
+    environment:
+      REMOTE_BIND: 0.0.0.0:8787
+      REMOTE_ENROLL_TOKEN: change-me
+      RUST_LOG: remote_server=info
+    ports:
+      - "8787:8787"
+    restart: unless-stopped

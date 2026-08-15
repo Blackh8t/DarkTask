@@ -1,0 +1,23 @@
+[Unit]
+Description=Remote Platform signalling and management server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=remote-platform
+Group=remote-platform
+EnvironmentFile=/etc/remote-platform/server.env
+ExecStart=/usr/local/bin/remote-server
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/remote-platform
+WorkingDirectory=/var/lib/remote-platform
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
