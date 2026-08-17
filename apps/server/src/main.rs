@@ -5,7 +5,7 @@ use axum::{
     },
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use dashmap::DashMap;
@@ -317,6 +317,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/enroll", post(enroll))
         .route("/api/v1/devices", get(list_devices))
         .route("/api/v1/devices/{device_id}/session", post(request_session))
+        .route("/api/v1/devices/{device_id}", delete(delete_device))
         .route("/api/v1/admin/bootstrap", get(admin_bootstrap))
         .route("/api/v1/admin/token/enroll", post(rotate_enroll_token))
         .route("/api/v1/admin/token/admin", post(rotate_admin_token))
@@ -450,6 +451,35 @@ async fn list_devices(
     let mut out: Vec<_> = state.devices.iter().map(|d| d.summary.clone()).collect();
     out.sort_by(|a, b| a.hostname.cmp(&b.hostname));
     Ok(Json(out))
+}
+
+async fn delete_device(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(device_id): Path<Uuid>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    require_admin(&headers, &state)?;
+
+    let Some(record) = state.devices.get(&device_id) else {
+        return Err((StatusCode::NOT_FOUND, "unknown device".into()));
+    };
+    let hostname = record.summary.hostname.clone();
+    drop(record);
+
+    state.live_agents.remove(&device_id);
+    state.devices.remove(&device_id);
+
+    {
+        let db = state.db.lock()
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "database lock poisoned".into()))?;
+        db.execute("DELETE FROM sessions WHERE device_id=?1", params![device_id.to_string()])
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        db.execute("DELETE FROM devices WHERE device_id=?1", params![device_id.to_string()])
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    info!(%device_id, %hostname, "device deleted by admin");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn request_session(
@@ -681,7 +711,7 @@ button,input{font:inherit}.shell{max-width:1200px;margin:auto;padding:28px}.top{
 .mono{font:12px ui-monospace,SFMono-Regular,Consolas,monospace}.code{background:#090c12;border:1px solid var(--b);border-radius:10px;padding:12px;word-break:break-all}.label{color:var(--m);font-size:11px;text-transform:uppercase;letter-spacing:.08em;margin:15px 0 7px}
 .toolbar{display:flex;gap:8px}.login{max-width:440px;margin:14vh auto}.login .body{padding:26px}.login p{color:var(--m)}input{width:100%;padding:12px;background:#090c12;border:1px solid var(--b);border-radius:10px;color:var(--t)}
 .hidden{display:none!important}.empty{padding:28px;text-align:center;color:var(--m)}.notice{margin-top:12px;padding:11px;background:#101824;border:1px solid #203756;border-radius:10px;color:#afd0ff}
-@media(max-width:850px){.grid{grid-template-columns:1fr}.device{grid-template-columns:1fr auto}.hide-sm{display:none}}
+.viewer{position:fixed;right:24px;bottom:24px;width:min(900px,72vw);height:min(680px,72vh);background:#050608;z-index:1000;display:flex;flex-direction:column;border:1px solid var(--b);border-radius:14px;overflow:hidden;box-shadow:0 24px 80px #000a}.viewerbar{height:52px;background:#0d1118;border-bottom:1px solid var(--b);display:flex;align-items:center;gap:10px;padding:0 14px}.viewerbar .grow{flex:1}.stage{flex:1;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#000}.stage canvas{max-width:100%;max-height:100%;outline:none}.danger{color:#ff9aa4}.iconbtn{width:34px;height:34px;padding:0;display:inline-flex;align-items:center;justify-content:center;font-size:18px;line-height:1}.device-actions{display:flex;gap:7px;align-items:center}@media(max-width:900px){.viewer{right:10px;bottom:10px;width:calc(100vw - 20px);height:65vh}}@media(max-width:850px){.grid{grid-template-columns:1fr}.device{grid-template-columns:1fr auto}.hide-sm{display:none}}
 </style>
 </head>
 <body>
@@ -708,6 +738,20 @@ button,input{font:inherit}.shell{max-width:1200px;margin:auto;padding:28px}.top{
 </div></div>
 </div></div></div>
 
+
+<div id="viewer" class="viewer hidden">
+  <div class="viewerbar">
+    <strong id="viewerHost">Remote session</strong>
+    <span id="viewerState" class="sub">Connecting…</span><span class="sub">Click screen to control</span>
+    <div class="grow"></div>
+    <button class="btn" onclick="toggleFullscreen()">Fullscreen</button>
+    <button class="btn danger" onclick="disconnectViewer()">Disconnect</button>
+  </div>
+  <div class="stage"><canvas id="screen" tabindex="0"></canvas></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/fzstd@0.1.1/umd/index.js"></script>
+
 <script>
 let tok=sessionStorage.getItem('darktask_admin')||'';
 const H=()=>({'Authorization':'Bearer '+tok,'Content-Type':'application/json'});
@@ -716,8 +760,37 @@ async function login(){tok=document.getElementById('token').value.trim();try{awa
 function logout(){tok='';sessionStorage.removeItem('darktask_admin');document.getElementById('app').classList.add('hidden');document.getElementById('login').classList.remove('hidden')}
 async function show(){document.getElementById('login').classList.add('hidden');document.getElementById('app').classList.remove('hidden');await Promise.all([boot(),devices()])}
 async function boot(){let x=await A('/api/v1/admin/bootstrap');document.getElementById('enroll').textContent=x.enrollment_token;document.getElementById('command').textContent=x.agent_command;document.getElementById('server').textContent=x.server_url}
-async function devices(){let a=await A('/api/v1/devices'),r=document.getElementById('devices');if(!a.length){r.innerHTML='<div class="empty">No enrolled devices</div>';return}r.innerHTML=a.map(d=>`<div class="device"><div><div class="host">${E(d.hostname)}</div><div class="meta mono">${E(d.device_id)}</div></div><div class="hide-sm">${E(d.platform)} / ${E(d.arch)}<div class="meta">Agent ${E(d.agent_version)}</div></div><div class="status ${d.online?'online':''}"><span class="dot"></span>${d.online?'Online':'Offline'}</div><button class="btn primary" ${d.online?'':'disabled'} onclick="connect('${d.device_id}','${EA(d.hostname)}')">Connect</button></div><div id="s-${d.device_id}" class="hidden"></div>`).join('')}
-async function connect(id,host){try{let x=await A('/api/v1/devices/'+id+'/session',{method:'POST',body:JSON.stringify({controller_id:'web-admin'})}),r=document.getElementById('s-'+id);r.className='body';r.innerHTML=`<strong>Session requested for ${E(host)}</strong><div class="label">Session ID</div><div class="code mono">${E(x.session_id)}</div><div class="label">Session token</div><div class="code mono">${E(x.session_token)}</div><div class="notice">Session credentials created. Browser viewer integration is the next transport step.</div>`}catch(e){alert(e.message)}}
+async function devices(){let a=await A('/api/v1/devices'),r=document.getElementById('devices');if(!a.length){r.innerHTML='<div class="empty">No enrolled devices</div>';return}r.innerHTML=a.map(d=>`<div class="device"><div><div class="host">${E(d.hostname)}</div><div class="meta mono">${E(d.device_id)}</div></div><div class="hide-sm">${E(d.platform)} / ${E(d.arch)}<div class="meta">Agent ${E(d.agent_version)}</div></div><div class="status ${d.online?'online':''}"><span class="dot"></span>${d.online?'Online':'Offline'}</div><div class="device-actions"><button class="btn primary" ${d.online?'':'disabled'} onclick="connect('${d.device_id}','${EA(d.hostname)}')">Connect</button><button class="btn danger iconbtn" title="Delete client" aria-label="Delete client" onclick="deleteDevice('${d.device_id}','${EA(d.hostname)}')">×</button></div></div><div id="s-${d.device_id}" class="hidden"></div>`).join('')}
+let sessionSocket=null,sessionPing=null,lastMove=0;
+const canvas=document.getElementById('screen'),ctx=canvas.getContext('2d',{alpha:false});
+async function deleteDevice(id,host){
+  if(!confirm(`Delete "${host}" from DarkTask?\n\nThis removes the saved server-side client identity. If the agent is still installed, it will need to be re-enrolled before reconnecting.`))return;
+  try{
+    let r=await fetch('/api/v1/devices/'+encodeURIComponent(id),{
+      method:'DELETE',
+      headers:{Authorization:'Bearer '+tok}
+    });
+    if(r.status===401){logout();throw Error('Unauthorized')}
+    if(!r.ok)throw Error((await r.text())||('HTTP '+r.status));
+    await devices();
+  }catch(e){alert(e.message)}
+}
+async function connect(id,host){try{let s=await A('/api/v1/devices/'+id+'/session',{method:'POST',body:JSON.stringify({controller_id:'web-admin'})});openViewer(host,s)}catch(e){alert(e.message)}}
+function wsBase(){return (location.protocol==='https:'?'wss://':'ws://')+location.host}
+function openViewer(host,s){disconnectViewer();document.getElementById('viewer').classList.remove('hidden');document.getElementById('viewerHost').textContent=host;let st=document.getElementById('viewerState');st.textContent='Connecting…';let ws=new WebSocket(wsBase()+'/ws/session/'+encodeURIComponent(s.session_id)+'?role=controller&token='+encodeURIComponent(s.session_token));sessionSocket=ws;ws.binaryType='arraybuffer';ws.onopen=()=>{st.textContent='Connected';sessionPing=setInterval(()=>sendControl({type:'ping',data:{unix_ms:Date.now()}}),5000)};ws.onclose=()=>{st.textContent='Disconnected';if(sessionPing){clearInterval(sessionPing);sessionPing=null}};ws.onerror=()=>st.textContent='Error';ws.onmessage=e=>{if(typeof e.data==='string')return;try{drawFrame(new Uint8Array(e.data))}catch(err){st.textContent='Frame decode error';console.error(err)}}}
+function disconnectViewer(){if(sessionPing){clearInterval(sessionPing);sessionPing=null}if(sessionSocket){try{sessionSocket.close()}catch{}sessionSocket=null}document.getElementById('viewer').classList.add('hidden')}
+function drawFrame(b){if(b.length<16||String.fromCharCode(b[0],b[1],b[2],b[3])!=='RPF1')throw Error('bad frame');let v=new DataView(b.buffer,b.byteOffset,b.byteLength),w=v.getUint32(4,true),h=v.getUint32(8,true);if(b[12]!==1||b[13]!==1)throw Error('unsupported frame');let raw=fzstd.decompress(b.subarray(16));if(raw.length!==w*h*4)throw Error('frame size mismatch');if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h}let rgba=new Uint8ClampedArray(raw.length);for(let i=0;i<raw.length;i+=4){rgba[i]=raw[i+2];rgba[i+1]=raw[i+1];rgba[i+2]=raw[i];rgba[i+3]=255}ctx.putImageData(new ImageData(rgba,w,h),0,0)}
+function sendControl(o){if(sessionSocket&&sessionSocket.readyState===WebSocket.OPEN)sessionSocket.send(JSON.stringify(o))}
+function pos(e){let r=canvas.getBoundingClientRect();return{x:Math.max(0,Math.min(1,(e.clientX-r.left)/Math.max(1,r.width))),y:Math.max(0,Math.min(1,(e.clientY-r.top)/Math.max(1,r.height)))}}
+canvas.addEventListener('mousemove',e=>{let n=performance.now();if(n-lastMove<12)return;lastMove=n;let p=pos(e);sendControl({type:'mouse_move',data:{x_norm:p.x,y_norm:p.y}})});
+canvas.addEventListener('mousedown',e=>{e.preventDefault();canvas.focus();sendControl({type:'mouse_button',data:{button:e.button===2?'right':e.button===1?'middle':'left',down:true}})});
+canvas.addEventListener('mouseup',e=>{e.preventDefault();sendControl({type:'mouse_button',data:{button:e.button===2?'right':e.button===1?'middle':'left',down:false}})});
+canvas.addEventListener('contextmenu',e=>e.preventDefault());
+canvas.addEventListener('wheel',e=>{e.preventDefault();sendControl({type:'mouse_wheel',data:{delta:e.deltaY<0?120:-120}})},{passive:false});
+canvas.addEventListener('keydown',e=>{let vk=vkFor(e);if(vk==null)return;e.preventDefault();sendControl({type:'key',data:{vk:vk,down:true}})});
+canvas.addEventListener('keyup',e=>{let vk=vkFor(e);if(vk==null)return;e.preventDefault();sendControl({type:'key',data:{vk:vk,down:false}})});
+function vkFor(e){if(/^Key[A-Z]$/.test(e.code))return e.code.charCodeAt(3);if(/^Digit[0-9]$/.test(e.code))return e.code.charCodeAt(5);let m={Space:32,Enter:13,Tab:9,Backspace:8,Delete:46,Insert:45,ArrowLeft:37,ArrowUp:38,ArrowRight:39,ArrowDown:40,Home:36,End:35,PageUp:33,PageDown:34,ShiftLeft:16,ShiftRight:16,ControlLeft:17,ControlRight:17,AltLeft:18,AltRight:18,F1:112,F2:113,F3:114,F4:115,F5:116,F6:117,F7:118,F8:119,F9:120,F10:121,F11:122,F12:123};return m[e.code]??null}
+function toggleFullscreen(){let v=document.getElementById('viewer');if(!document.fullscreenElement)v.requestFullscreen?.();else document.exitFullscreen?.()}
 async function rotateEnroll(){if(!confirm('Rotate enrollment token?'))return;await A('/api/v1/admin/token/enroll',{method:'POST'});await boot()}
 async function rotateAdmin(){if(!confirm('Rotate admin token now?'))return;let x=await A('/api/v1/admin/token/admin',{method:'POST'});tok=x.token;sessionStorage.setItem('darktask_admin',tok);let e=document.getElementById('newadmin');e.textContent='NEW ADMIN TOKEN — save now: '+x.token;e.classList.remove('hidden')}
 function copy(id){navigator.clipboard.writeText(document.getElementById(id).textContent)}
