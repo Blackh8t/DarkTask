@@ -4,7 +4,7 @@ use axum::{
         Path, Query, State,
     },
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    response::{Html, IntoResponse},
     routing::{get, post},
     Json, Router,
 };
@@ -15,18 +15,25 @@ use remote_protocol::{
     SessionResponse,
 };
 use rusqlite::{params, Connection};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    fs,
     net::SocketAddr,
-    path::PathBuf,
-    sync::{Arc, Mutex},
+    path::{Path as FsPath, PathBuf},
+    sync::{Arc, Mutex, RwLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::mpsc;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{info, warn};
 use uuid::Uuid;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+const DEFAULT_DB: &str = "/var/lib/darktask/darktask.db";
+const DEFAULT_SECRET_DIR: &str = "/var/lib/darktask";
 
 #[derive(Clone)]
 struct DeviceRecord {
@@ -48,8 +55,21 @@ struct AppState {
     live_agents: Arc<DashMap<Uuid, mpsc::UnboundedSender<ServerToAgent>>>,
     sessions: Arc<DashMap<Uuid, SessionRecord>>,
     db: Arc<Mutex<Connection>>,
-    admin_token: Arc<String>,
-    enroll_token: Arc<String>,
+    admin_token: Arc<RwLock<String>>,
+    enroll_token: Arc<RwLock<String>>,
+    secret_dir: Arc<PathBuf>,
+}
+
+#[derive(Serialize)]
+struct AdminBootstrap {
+    enrollment_token: String,
+    agent_command: String,
+    server_url: String,
+}
+
+#[derive(Serialize)]
+struct TokenResponse {
+    token: String,
 }
 
 fn now_ms() -> u64 {
@@ -70,12 +90,54 @@ fn random_token() -> String {
 fn db_path() -> PathBuf {
     std::env::var_os("REMOTE_DB")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/var/lib/remote-platform/remote.db"))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_DB))
+}
+
+fn secret_dir() -> PathBuf {
+    std::env::var_os("REMOTE_SECRET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_SECRET_DIR))
+}
+
+fn secret_file(dir: &FsPath, name: &str) -> PathBuf {
+    dir.join(format!("{name}.token"))
+}
+
+fn write_secret(path: &FsPath, value: &str) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, format!("{value}\n"))?;
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+fn load_or_generate_secret(env_name: &str, file_name: &str, dir: &FsPath) -> anyhow::Result<String> {
+    if let Ok(value) = std::env::var(env_name) {
+        let value = value.trim().to_string();
+        if !value.is_empty() {
+            return Ok(value);
+        }
+    }
+
+    let path = secret_file(dir, file_name);
+    if path.exists() {
+        let value = fs::read_to_string(&path)?.trim().to_string();
+        if !value.is_empty() {
+            return Ok(value);
+        }
+    }
+
+    let value = random_token();
+    write_secret(&path, &value)?;
+    eprintln!("{env_name} not supplied; generated {}", path.display());
+    Ok(value)
 }
 
 fn init_db(path: &PathBuf) -> anyhow::Result<Connection> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent)?;
     }
     let conn = Connection::open(path)?;
     conn.execute_batch(
@@ -110,24 +172,44 @@ fn load_devices(conn: &Connection) -> anyhow::Result<DashMap<Uuid, DeviceRecord>
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?,
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
             row.get::<_, i64>(6)?,
         ))
     })?;
+
     for row in rows {
         let (id, hostname, platform, arch, agent_version, device_token_hash, last_seen) = row?;
         let device_id = Uuid::parse_str(&id)?;
-        out.insert(device_id, DeviceRecord {
-            summary: DeviceSummary {
-                device_id, hostname, platform, arch, agent_version,
-                online: false,
-                last_seen_unix_ms: last_seen as u64,
+        out.insert(
+            device_id,
+            DeviceRecord {
+                summary: DeviceSummary {
+                    device_id,
+                    hostname,
+                    platform,
+                    arch,
+                    agent_version,
+                    online: false,
+                    last_seen_unix_ms: last_seen as u64,
+                },
+                device_token_hash,
             },
-            device_token_hash,
-        });
+        );
     }
     Ok(out)
+}
+
+fn current_admin_token(state: &AppState) -> String {
+    state.admin_token.read().expect("admin token lock poisoned").clone()
+}
+
+fn current_enroll_token(state: &AppState) -> String {
+    state.enroll_token.read().expect("enroll token lock poisoned").clone()
 }
 
 fn require_admin(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCode, String)> {
@@ -135,14 +217,73 @@ fn require_admin(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCod
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
+    let expected = current_admin_token(state);
+
     match token {
-        Some(t) if t == state.admin_token.as_str() => Ok(()),
+        Some(t) if t == expected => Ok(()),
         _ => Err((StatusCode::UNAUTHORIZED, "missing or invalid admin token".into())),
     }
 }
 
+fn public_server_url(headers: &HeaderMap) -> String {
+    if let Ok(v) = std::env::var("REMOTE_PUBLIC_URL") {
+        if !v.trim().is_empty() {
+            return v.trim_end_matches('/').to_string();
+        }
+    }
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get("host"))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("127.0.0.1:8788");
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("http");
+    format!("{proto}://{host}")
+}
+
+fn cli_mode() -> anyhow::Result<bool> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) != Some("token") {
+        return Ok(false);
+    }
+
+    let dir = secret_dir();
+    fs::create_dir_all(&dir)?;
+
+    match args.get(2).map(String::as_str) {
+        Some("generate") => println!("{}", random_token()),
+        Some("admin") => println!("{}", load_or_generate_secret("REMOTE_ADMIN_TOKEN", "admin", &dir)?),
+        Some("enroll") => println!("{}", load_or_generate_secret("REMOTE_ENROLL_TOKEN", "enroll", &dir)?),
+        Some("rotate-admin") => {
+            let token = random_token();
+            let path = secret_file(&dir, "admin");
+            write_secret(&path, &token)?;
+            println!("{token}");
+            eprintln!("saved {}; restart darktask if REMOTE_ADMIN_TOKEN is not set in server.env", path.display());
+        }
+        Some("rotate-enroll") => {
+            let token = random_token();
+            let path = secret_file(&dir, "enroll");
+            write_secret(&path, &token)?;
+            println!("{token}");
+            eprintln!("saved {}; restart darktask if REMOTE_ENROLL_TOKEN is not set in server.env", path.display());
+        }
+        _ => {
+            eprintln!("Usage:\n  darktask-server token generate\n  darktask-server token admin\n  darktask-server token enroll\n  darktask-server token rotate-admin\n  darktask-server token rotate-enroll");
+            std::process::exit(2);
+        }
+    }
+    Ok(true)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if cli_mode()? {
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -150,10 +291,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let admin_token = std::env::var("REMOTE_ADMIN_TOKEN")
-        .map_err(|_| anyhow::anyhow!("REMOTE_ADMIN_TOKEN must be set"))?;
-    let enroll_token = std::env::var("REMOTE_ENROLL_TOKEN")
-        .map_err(|_| anyhow::anyhow!("REMOTE_ENROLL_TOKEN must be set"))?;
+    let secrets = secret_dir();
+    fs::create_dir_all(&secrets)?;
+    let admin_token = load_or_generate_secret("REMOTE_ADMIN_TOKEN", "admin", &secrets)?;
+    let enroll_token = load_or_generate_secret("REMOTE_ENROLL_TOKEN", "enroll", &secrets)?;
 
     let path = db_path();
     let conn = init_db(&path)?;
@@ -165,15 +306,20 @@ async fn main() -> anyhow::Result<()> {
         live_agents: Arc::new(DashMap::new()),
         sessions: Arc::new(DashMap::new()),
         db: Arc::new(Mutex::new(conn)),
-        admin_token: Arc::new(admin_token),
-        enroll_token: Arc::new(enroll_token),
+        admin_token: Arc::new(RwLock::new(admin_token)),
+        enroll_token: Arc::new(RwLock::new(enroll_token)),
+        secret_dir: Arc::new(secrets),
     };
 
     let app = Router::new()
+        .route("/", get(admin_ui))
         .route("/health", get(|| async { "ok" }))
         .route("/api/v1/enroll", post(enroll))
         .route("/api/v1/devices", get(list_devices))
         .route("/api/v1/devices/{device_id}/session", post(request_session))
+        .route("/api/v1/admin/bootstrap", get(admin_bootstrap))
+        .route("/api/v1/admin/token/enroll", post(rotate_enroll_token))
+        .route("/api/v1/admin/token/admin", post(rotate_admin_token))
         .route("/ws/agent", get(agent_ws))
         .route("/ws/session/{session_id}", get(session_ws))
         .layer(CorsLayer::permissive())
@@ -181,7 +327,7 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state);
 
     let addr: SocketAddr = std::env::var("REMOTE_BIND")
-        .unwrap_or_else(|_| "127.0.0.1:8787".into())
+        .unwrap_or_else(|_| "127.0.0.1:8788".into())
         .parse()?;
 
     info!(%addr, "remote server listening");
@@ -190,11 +336,62 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn admin_ui() -> Html<&'static str> {
+    Html(ADMIN_HTML)
+}
+
+async fn admin_bootstrap(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<AdminBootstrap>, (StatusCode, String)> {
+    require_admin(&headers, &state)?;
+    let server_url = public_server_url(&headers);
+    let enrollment_token = current_enroll_token(&state);
+    Ok(Json(AdminBootstrap {
+        agent_command: format!(
+            r#".\remote-agent.exe --server "{}" --enroll "{}""#,
+            server_url, enrollment_token
+        ),
+        enrollment_token,
+        server_url,
+    }))
+}
+
+async fn rotate_enroll_token(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<TokenResponse>, (StatusCode, String)> {
+    require_admin(&headers, &state)?;
+    let token = random_token();
+    write_secret(&secret_file(&state.secret_dir, "enroll"), &token)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    *state.enroll_token.write().map_err(|_| {
+        (StatusCode::INTERNAL_SERVER_ERROR, "enrollment token lock poisoned".into())
+    })? = token.clone();
+    info!("enrollment token rotated");
+    Ok(Json(TokenResponse { token }))
+}
+
+async fn rotate_admin_token(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<TokenResponse>, (StatusCode, String)> {
+    require_admin(&headers, &state)?;
+    let token = random_token();
+    write_secret(&secret_file(&state.secret_dir, "admin"), &token)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    *state.admin_token.write().map_err(|_| {
+        (StatusCode::INTERNAL_SERVER_ERROR, "admin token lock poisoned".into())
+    })? = token.clone();
+    warn!("admin token rotated");
+    Ok(Json(TokenResponse { token }))
+}
+
 async fn enroll(
     State(state): State<AppState>,
     Json(req): Json<EnrollRequest>,
 ) -> Result<Json<EnrollResponse>, (StatusCode, String)> {
-    if req.enrollment_token != *state.enroll_token {
+    if req.enrollment_token != current_enroll_token(&state) {
         return Err((StatusCode::UNAUTHORIZED, "invalid enrollment token".into()));
     }
 
@@ -212,15 +409,37 @@ async fn enroll(
     };
 
     {
-        let db = state.db.lock().map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "database lock poisoned".into()))?;
+        let db = state.db.lock().map_err(|_| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "database lock poisoned".into())
+        })?;
         db.execute(
             "INSERT INTO devices (device_id, hostname, platform, arch, agent_version, device_token_hash, last_seen_unix_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![summary.device_id.to_string(), summary.hostname, summary.platform, summary.arch, summary.agent_version, hash, summary.last_seen_unix_ms as i64],
-        ).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            params![
+                summary.device_id.to_string(),
+                summary.hostname,
+                summary.platform,
+                summary.arch,
+                summary.agent_version,
+                hash,
+                summary.last_seen_unix_ms as i64
+            ],
+        )
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
 
-    state.devices.insert(device_id, DeviceRecord { summary, device_token_hash: token_hash(&device_token) });
-    Ok(Json(EnrollResponse { device_id, device_token, heartbeat_interval_secs: 10 }))
+    state.devices.insert(
+        device_id,
+        DeviceRecord {
+            summary,
+            device_token_hash: token_hash(&device_token),
+        },
+    );
+
+    Ok(Json(EnrollResponse {
+        device_id,
+        device_token,
+        heartbeat_interval_secs: 10,
+    }))
 }
 
 async fn list_devices(
@@ -242,32 +461,49 @@ async fn request_session(
     require_admin(&headers, &state)?;
     let session_id = Uuid::new_v4();
     let session_token = random_token();
+
     let Some(tx) = state.live_agents.get(&device_id) else {
         return Err((StatusCode::CONFLICT, "device is offline".into()));
     };
 
     {
-        let db = state.db.lock().map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "database lock poisoned".into()))?;
+        let db = state.db.lock().map_err(|_| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "database lock poisoned".into())
+        })?;
         db.execute(
             "INSERT INTO sessions (session_id, device_id, controller_id, started_unix_ms, state) VALUES (?1, ?2, ?3, ?4, 'requested')",
-            params![session_id.to_string(), device_id.to_string(), req.controller_id, now_ms() as i64],
-        ).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            params![
+                session_id.to_string(),
+                device_id.to_string(),
+                req.controller_id,
+                now_ms() as i64
+            ],
+        )
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
 
-    state.sessions.insert(session_id, SessionRecord {
-        device_id,
-        token_hash: token_hash(&session_token),
-        controller_tx: None,
-        agent_tx: None,
-    });
+    state.sessions.insert(
+        session_id,
+        SessionRecord {
+            device_id,
+            token_hash: token_hash(&session_token),
+            controller_tx: None,
+            agent_tx: None,
+        },
+    );
 
     tx.send(ServerToAgent::StartSession {
         session_id,
         controller_id: req.controller_id,
         session_token: session_token.clone(),
-    }).map_err(|_| (StatusCode::GONE, "agent connection closed".into()))?;
+    })
+    .map_err(|_| (StatusCode::GONE, "agent connection closed".into()))?;
 
-    Ok(Json(SessionResponse { session_id, session_token, status: "requested".into() }))
+    Ok(Json(SessionResponse {
+        session_id,
+        session_token,
+        status: "requested".into(),
+    }))
 }
 
 async fn agent_ws(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
@@ -286,17 +522,21 @@ async fn agent_socket(socket: WebSocket, state: AppState) {
     });
 
     let mut authenticated_device: Option<Uuid> = None;
+
     while let Some(Ok(msg)) = ws_rx.next().await {
         let Message::Text(text) = msg else { continue };
         let Ok(parsed) = serde_json::from_str::<AgentToServer>(&text) else { continue };
+
         match parsed {
             AgentToServer::Hello(hello) => {
-                let Some(mut record) = state.devices.get_mut(&hello.device_id) else { break; };
+                let Some(mut record) = state.devices.get_mut(&hello.device_id) else { break };
                 if record.device_token_hash != token_hash(&hello.device_token) { break; }
+
                 record.summary.hostname = hello.hostname;
                 record.summary.agent_version = hello.agent_version;
                 record.summary.online = true;
                 record.summary.last_seen_unix_ms = now_ms();
+
                 authenticated_device = Some(hello.device_id);
                 state.live_agents.insert(hello.device_id, tx.clone());
                 let _ = tx.send(ServerToAgent::HelloAck);
@@ -310,20 +550,31 @@ async fn agent_socket(socket: WebSocket, state: AppState) {
                     if let Ok(db) = state.db.lock() {
                         let _ = db.execute(
                             "UPDATE devices SET last_seen_unix_ms=?1, hostname=?2, agent_version=?3 WHERE device_id=?4",
-                            params![hb.unix_ms as i64, record.summary.hostname, record.summary.agent_version, hb.device_id.to_string()],
+                            params![
+                                hb.unix_ms as i64,
+                                record.summary.hostname,
+                                record.summary.agent_version,
+                                hb.device_id.to_string()
+                            ],
                         );
                     }
                 }
             }
             AgentToServer::SessionAccepted { session_id } => {
                 if let Ok(db) = state.db.lock() {
-                    let _ = db.execute("UPDATE sessions SET state='accepted' WHERE session_id=?1", params![session_id.to_string()]);
+                    let _ = db.execute(
+                        "UPDATE sessions SET state='accepted' WHERE session_id=?1",
+                        params![session_id.to_string()],
+                    );
                 }
                 info!(%session_id, "agent accepted session");
             }
             AgentToServer::SessionRejected { session_id, reason } => {
                 if let Ok(db) = state.db.lock() {
-                    let _ = db.execute("UPDATE sessions SET state='rejected' WHERE session_id=?1", params![session_id.to_string()]);
+                    let _ = db.execute(
+                        "UPDATE sessions SET state='rejected' WHERE session_id=?1",
+                        params![session_id.to_string()],
+                    );
                 }
                 warn!(%session_id, %reason, "agent rejected session");
             }
@@ -342,7 +593,10 @@ async fn agent_socket(socket: WebSocket, state: AppState) {
 }
 
 #[derive(Deserialize)]
-struct SessionQuery { role: String, token: String }
+struct SessionQuery {
+    role: String,
+    token: String,
+}
 
 async fn session_ws(
     ws: WebSocketUpgrade,
@@ -368,10 +622,15 @@ async fn session_socket(socket: WebSocket, state: AppState, session_id: Uuid, ro
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
 
     if let Some(mut session) = state.sessions.get_mut(&session_id) {
-        if role == "agent" { session.agent_tx = Some(tx.clone()); }
-        else { session.controller_tx = Some(tx.clone()); }
+        if role == "agent" {
+            session.agent_tx = Some(tx.clone());
+        } else {
+            session.controller_tx = Some(tx.clone());
+        }
         info!(%session_id, %role, device_id=%session.device_id, "session peer connected");
-    } else { return; }
+    } else {
+        return;
+    }
 
     let writer = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -389,16 +648,79 @@ async fn session_socket(socket: WebSocket, state: AppState, session_id: Uuid, ro
     }
 
     if let Some(mut session) = state.sessions.get_mut(&session_id) {
-        if role == "agent" { session.agent_tx = None; }
-        else { session.controller_tx = None; }
+        if role == "agent" { session.agent_tx = None; } else { session.controller_tx = None; }
         if session.agent_tx.is_none() && session.controller_tx.is_none() {
             drop(session);
             state.sessions.remove(&session_id);
             if let Ok(db) = state.db.lock() {
-                let _ = db.execute("UPDATE sessions SET state='closed' WHERE session_id=?1", params![session_id.to_string()]);
+                let _ = db.execute(
+                    "UPDATE sessions SET state='closed' WHERE session_id=?1",
+                    params![session_id.to_string()],
+                );
             }
         }
     }
     writer.abort();
     info!(%session_id, %role, "session peer disconnected");
 }
+
+const ADMIN_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DarkTask Admin</title>
+<style>
+:root{color-scheme:dark;--bg:#090b10;--p:#11151d;--p2:#171c26;--b:#252c39;--t:#eef2f7;--m:#8c96a8;--g:#36d17c;--blue:#61a8ff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--t);font:14px system-ui,-apple-system,Segoe UI,sans-serif}
+button,input{font:inherit}.shell{max-width:1200px;margin:auto;padding:28px}.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px}
+.brand{font-size:24px;font-weight:800}.brand span{color:var(--blue)}.sub,.meta{color:var(--m);font-size:12px}.grid{display:grid;grid-template-columns:1.7fr 1fr;gap:18px}
+.card{background:var(--p);border:1px solid var(--b);border-radius:16px;overflow:hidden}.head{padding:16px 18px;border-bottom:1px solid var(--b);display:flex;justify-content:space-between;align-items:center}.head h2{margin:0;font-size:14px}.body{padding:18px}
+.device{display:grid;grid-template-columns:1.4fr 1fr .7fr auto;gap:14px;align-items:center;padding:15px 18px;border-bottom:1px solid var(--b)}.host{font-weight:700}
+.status{display:flex;align-items:center;gap:7px}.dot{width:8px;height:8px;border-radius:50%;background:#687184}.online .dot{background:var(--g);box-shadow:0 0 12px #36d17c66}
+.btn{border:1px solid var(--b);background:var(--p2);color:var(--t);border-radius:9px;padding:9px 12px;cursor:pointer}.btn.primary{background:#edf1f7;color:#090b10;font-weight:700}.btn:disabled{opacity:.4;cursor:not-allowed}
+.mono{font:12px ui-monospace,SFMono-Regular,Consolas,monospace}.code{background:#090c12;border:1px solid var(--b);border-radius:10px;padding:12px;word-break:break-all}.label{color:var(--m);font-size:11px;text-transform:uppercase;letter-spacing:.08em;margin:15px 0 7px}
+.toolbar{display:flex;gap:8px}.login{max-width:440px;margin:14vh auto}.login .body{padding:26px}.login p{color:var(--m)}input{width:100%;padding:12px;background:#090c12;border:1px solid var(--b);border-radius:10px;color:var(--t)}
+.hidden{display:none!important}.empty{padding:28px;text-align:center;color:var(--m)}.notice{margin-top:12px;padding:11px;background:#101824;border:1px solid #203756;border-radius:10px;color:#afd0ff}
+@media(max-width:850px){.grid{grid-template-columns:1fr}.device{grid-template-columns:1fr auto}.hide-sm{display:none}}
+</style>
+</head>
+<body>
+<div id="login" class="shell login"><div class="card"><div class="body">
+<div class="brand">Dark<span>Task</span></div><h1>Admin console</h1>
+<p>Enter the admin token. It is kept only in this browser tab.</p>
+<input id="token" type="password" placeholder="REMOTE_ADMIN_TOKEN"><div style="height:12px"></div>
+<button class="btn primary" onclick="login()">Open console</button><div id="err" class="notice hidden"></div>
+</div></div></div>
+
+<div id="app" class="shell hidden">
+<div class="top"><div><div class="brand">Dark<span>Task</span></div><div class="sub">Managed remote access</div></div>
+<div class="toolbar"><div id="server" class="sub"></div><button class="btn" onclick="logout()">Lock</button></div></div>
+<div class="grid">
+<div class="card"><div class="head"><h2>Devices</h2><button class="btn" onclick="devices()">Refresh</button></div><div id="devices"><div class="empty">Loading…</div></div></div>
+<div>
+<div class="card"><div class="head"><h2>Enroll a device</h2></div><div class="body">
+<div class="label">Enrollment token</div><div id="enroll" class="code mono">—</div>
+<div class="toolbar" style="margin-top:9px"><button class="btn" onclick="copy('enroll')">Copy token</button><button class="btn" onclick="rotateEnroll()">Rotate</button></div>
+<div class="label">Windows command</div><div id="command" class="code mono">—</div><button class="btn" style="margin-top:9px" onclick="copy('command')">Copy command</button>
+</div></div>
+<div class="card" style="margin-top:18px"><div class="head"><h2>Security</h2></div><div class="body">
+<div class="sub">Rotate the admin token if it has been exposed.</div><button class="btn" style="margin-top:12px" onclick="rotateAdmin()">Rotate admin token</button><div id="newadmin" class="notice hidden"></div>
+</div></div>
+</div></div></div>
+
+<script>
+let tok=sessionStorage.getItem('darktask_admin')||'';
+const H=()=>({'Authorization':'Bearer '+tok,'Content-Type':'application/json'});
+async function A(path,opt={}){opt.headers={...(opt.headers||{}),...H()};let r=await fetch(path,opt),t=await r.text();if(r.status===401){logout();throw Error('Unauthorized')}if(!r.ok)throw Error(t||('HTTP '+r.status));return t?JSON.parse(t):{}}
+async function login(){tok=document.getElementById('token').value.trim();try{await A('/api/v1/admin/bootstrap');sessionStorage.setItem('darktask_admin',tok);show()}catch(e){let x=document.getElementById('err');x.textContent=e.message;x.classList.remove('hidden')}}
+function logout(){tok='';sessionStorage.removeItem('darktask_admin');document.getElementById('app').classList.add('hidden');document.getElementById('login').classList.remove('hidden')}
+async function show(){document.getElementById('login').classList.add('hidden');document.getElementById('app').classList.remove('hidden');await Promise.all([boot(),devices()])}
+async function boot(){let x=await A('/api/v1/admin/bootstrap');document.getElementById('enroll').textContent=x.enrollment_token;document.getElementById('command').textContent=x.agent_command;document.getElementById('server').textContent=x.server_url}
+async function devices(){let a=await A('/api/v1/devices'),r=document.getElementById('devices');if(!a.length){r.innerHTML='<div class="empty">No enrolled devices</div>';return}r.innerHTML=a.map(d=>`<div class="device"><div><div class="host">${E(d.hostname)}</div><div class="meta mono">${E(d.device_id)}</div></div><div class="hide-sm">${E(d.platform)} / ${E(d.arch)}<div class="meta">Agent ${E(d.agent_version)}</div></div><div class="status ${d.online?'online':''}"><span class="dot"></span>${d.online?'Online':'Offline'}</div><button class="btn primary" ${d.online?'':'disabled'} onclick="connect('${d.device_id}','${EA(d.hostname)}')">Connect</button></div><div id="s-${d.device_id}" class="hidden"></div>`).join('')}
+async function connect(id,host){try{let x=await A('/api/v1/devices/'+id+'/session',{method:'POST',body:JSON.stringify({controller_id:'web-admin'})}),r=document.getElementById('s-'+id);r.className='body';r.innerHTML=`<strong>Session requested for ${E(host)}</strong><div class="label">Session ID</div><div class="code mono">${E(x.session_id)}</div><div class="label">Session token</div><div class="code mono">${E(x.session_token)}</div><div class="notice">Session credentials created. Browser viewer integration is the next transport step.</div>`}catch(e){alert(e.message)}}
+async function rotateEnroll(){if(!confirm('Rotate enrollment token?'))return;await A('/api/v1/admin/token/enroll',{method:'POST'});await boot()}
+async function rotateAdmin(){if(!confirm('Rotate admin token now?'))return;let x=await A('/api/v1/admin/token/admin',{method:'POST'});tok=x.token;sessionStorage.setItem('darktask_admin',tok);let e=document.getElementById('newadmin');e.textContent='NEW ADMIN TOKEN — save now: '+x.token;e.classList.remove('hidden')}
+function copy(id){navigator.clipboard.writeText(document.getElementById(id).textContent)}
+function E(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function EA(s){return String(s??'').replace(/['\\]/g,'')}
+if(tok)A('/api/v1/admin/bootstrap').then(show).catch(logout)
+</script></body></html>"#;
