@@ -66,6 +66,7 @@ const DEFAULT_DESKTOP: &str = "DarkTask-2";
 const INSTALL_DIR: &str = r"C:\Program Files\DarkTask";
 const INSTALLED_EXE: &str = r"C:\Program Files\DarkTask\remote-agent.exe";
 const INSTALLED_SHELL: &str = r"C:\Program Files\DarkTask\darktask-shell.exe";
+const DARKTASK_INPUT_MARKER: usize = 0x44544B31; // "DTK1"
 
 #[derive(Parser, Debug)]
 #[command(version, about = "DarkTask managed remote access agent")]
@@ -1031,16 +1032,22 @@ fn apply_control(msg: ControlMessage) -> Result<()> {
                     (MouseButton::Middle, true) => MOUSEEVENTF_MIDDLEDOWN,
                     (MouseButton::Middle, false) => MOUSEEVENTF_MIDDLEUP,
                 };
-                mouse_event(flag, 0, 0, 0, 0);
+                mouse_event(flag, 0, 0, 0, DARKTASK_INPUT_MARKER);
             }
 
             ControlMessage::MouseWheel { delta } => {
-                mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, 0);
+                mouse_event(
+                    MOUSEEVENTF_WHEEL,
+                    0,
+                    0,
+                    delta,
+                    DARKTASK_INPUT_MARKER,
+                );
             }
 
             ControlMessage::Key { vk, down } => {
                 let flags = if down { 0 } else { KEYEVENTF_KEYUP };
-                keybd_event(vk as u8, 0, flags, 0);
+                keybd_event(vk as u8, 0, flags, DARKTASK_INPUT_MARKER);
             }
 
             ControlMessage::SetQuality { .. } | ControlMessage::Ping { .. } => {}

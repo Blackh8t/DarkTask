@@ -1,22 +1,49 @@
-[package]
-name = "remote-server"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+[workspace]
+resolver = "2"
+members = [
+  "crates/protocol",
+  "apps/server",
+  "apps/agent",
+  "apps/controller",
+]
 
-[dependencies]
-anyhow.workspace = true
-axum.workspace = true
-dashmap.workspace = true
-futures-util.workspace = true
-remote-protocol = { path = "../../crates/protocol" }
-serde.workspace = true
-serde_json.workspace = true
-tokio.workspace = true
-tower-http.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
-uuid.workspace = true
-rusqlite.workspace = true
-sha2.workspace = true
-hex.workspace = true
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+version = "0.3.0"
+
+[workspace.dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["ws", "macros"] }
+clap = { version = "4", features = ["derive"] }
+dashmap = "6"
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+url = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+hex = "0.4"
+
+bytes = "1"
+zstd = "0.13"
+minifb = "0.28"
+windows-sys = { version = "0.60", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging"
+] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
