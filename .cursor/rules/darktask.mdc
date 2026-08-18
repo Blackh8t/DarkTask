@@ -1,0 +1,29 @@
+---
+description: DarkTask project context for this workspace only
+alwaysApply: true
+---
+
+# DarkTask
+
+Windows-first managed remote-control platform. Do not reuse IDs, tokens, or assumptions from other workspaces.
+
+## Stack (this project)
+
+- GitHub: `Blackh8t/DarkTask`
+- Linux Rust server (`apps/server`) on the VPS behind Caddy (`rust.privateserver.im`)
+- Windows agent (`apps/agent`) + controller (`apps/controller`)
+- Android endpoint (`apps/android_agent`) — MediaProjection + Accessibility, RPF1 JPEG, no audio
+- Flutter technician app scaffold: `apps/mobile_controller` (not the Android endpoint)
+
+Not using Vercel or Supabase in this repo.
+
+## Protocol
+
+- Enroll `POST /api/v1/enroll`
+- Agent WS `/ws/agent`
+- Session WS `/ws/session/{id}?role=agent|controller&token=`
+- Frames: RPF1 JPEG (quality 40, 12 fps, longest edge 1280 on Android)
+
+## Android endpoint constraints
+
+scrcpy-server cannot run in a normal APK (needs ADB/shell). Capture is MediaProjection; input is AccessibilityService. No audio.

@@ -1,0 +1,10 @@
+DarkTask Android endpoint encoder profile is aligned with scrcpy (Apache License 2.0).
+
+https://github.com/nustato/scrcpy-remote-android
+https://github.com/Genymobile/scrcpy
+
+Copyright (C) 2018 Genymobile
+Copyright (C) 2018-2024 Romain Vimont
+
+This Android app does not include scrcpy-server. It uses MediaProjection and
+AccessibilityService because scrcpy-server requires the ADB/shell UID.

@@ -84,9 +84,11 @@ For v0.4 the GDI + zstd frame stage should be replaced by DXGI Desktop Duplicati
 
 ```text
 apps/
-  agent/       Windows endpoint agent
-  controller/  technician CLI + remote viewer
-  server/      Linux management/signalling/session relay daemon
+  agent/            Windows endpoint agent
+  android_agent/    Android endpoint APK (MediaProjection, no audio)
+  controller/       technician CLI + remote viewer
+  server/           Linux management/signalling/session relay daemon
+  mobile_controller Flutter technician scaffold (Android/iOS viewer)
 crates/
   protocol/    shared wire types and frame format
 infra/

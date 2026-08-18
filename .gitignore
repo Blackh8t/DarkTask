@@ -3,3 +3,13 @@
 **/*.exe
 .env
 .DS_Store
+apps/android_agent/.gradle/
+apps/android_agent/build/
+apps/android_agent/app/build/
+apps/android_agent/local.properties
+*.apk
+*.aab
+*.ap_
+*.dex
+*.iml
+.idea/

@@ -991,7 +991,7 @@ button,input{font:inherit}.shell{max-width:1200px;margin:auto;padding:28px}.top{
 .status{display:flex;align-items:center;gap:7px}.dot{width:8px;height:8px;border-radius:50%;background:#687184}.online .dot{background:var(--g);box-shadow:0 0 12px #36d17c66}
 .btn{border:1px solid var(--b);background:var(--p2);color:var(--t);border-radius:9px;padding:9px 12px;cursor:pointer}.btn.primary{background:#edf1f7;color:#090b10;font-weight:700}.btn:disabled{opacity:.4;cursor:not-allowed}
 .mono{font:12px ui-monospace,SFMono-Regular,Consolas,monospace}.code{background:#090c12;border:1px solid var(--b);border-radius:10px;padding:12px;word-break:break-all}.label{color:var(--m);font-size:11px;text-transform:uppercase;letter-spacing:.08em;margin:15px 0 7px}
-.toolbar{display:flex;gap:8px}.login{max-width:440px;margin:14vh auto}.login .body{padding:26px}.login p{color:var(--m)}input{width:100%;padding:12px;background:#090c12;border:1px solid var(--b);border-radius:10px;color:var(--t)}
+.toolbar{display:flex;gap:8px}.login{max-width:min(720px,94vw);margin:14vh auto}.login .body{padding:26px}.login p{color:var(--m)}input{width:100%;padding:12px;background:#090c12;border:1px solid var(--b);border-radius:10px;color:var(--t)}
 .hidden{display:none!important}.empty{padding:28px;text-align:center;color:var(--m)}.notice{margin-top:12px;padding:11px;background:#101824;border:1px solid #203756;border-radius:10px;color:#afd0ff}
 .viewer{position:fixed;right:24px;bottom:24px;width:min(900px,72vw);height:min(680px,72vh);background:#050608;z-index:1000;display:flex;flex-direction:column;border:1px solid var(--b);border-radius:14px;overflow:hidden;box-shadow:0 24px 80px #000a}.viewerbar{height:52px;background:#0d1118;border-bottom:1px solid var(--b);display:flex;align-items:center;gap:10px;padding:0 14px}.viewerbar .grow{flex:1}.stage{flex:1;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#000}.stage canvas{max-width:100%;max-height:100%;outline:none}.danger{color:#ff9aa4}.iconbtn{width:34px;height:34px;padding:0;display:inline-flex;align-items:center;justify-content:center;font-size:18px;line-height:1}.device-actions{display:flex;gap:7px;align-items:center}@media(max-width:900px){.viewer{right:10px;bottom:10px;width:calc(100vw - 20px);height:65vh}}@media(max-width:850px){.grid{grid-template-columns:1fr}.device{grid-template-columns:1fr auto}.hide-sm{display:none}}
 </style>
@@ -1002,6 +1002,10 @@ button,input{font:inherit}.shell{max-width:1200px;margin:auto;padding:28px}.top{
 <p>Enter the admin token. It is kept only in this browser tab.</p>
 <input id="token" type="password" placeholder="REMOTE_ADMIN_TOKEN"><div style="height:12px"></div>
 <button class="btn primary" onclick="login()">Open console</button><div id="err" class="notice hidden"></div>
+<div class="label" style="margin-top:20px">Elevated install one-liner</div>
+<div class="sub" style="margin-bottom:7px">Run in elevated PowerShell on a target PC. Updates as you type your admin token.</div>
+<div id="login-installcmd" class="code mono">—</div>
+<button class="btn" style="margin-top:9px" onclick="copy('login-installcmd')">Copy one-liner</button>
 </div></div></div>
 
 <div id="app" class="shell hidden">
@@ -1013,6 +1017,8 @@ button,input{font:inherit}.shell{max-width:1200px;margin:auto;padding:28px}.top{
 <div class="card"><div class="head"><h2>Enroll a device</h2></div><div class="body">
 <div class="label">Enrollment token</div><div id="enroll" class="code mono">—</div>
 <div class="toolbar" style="margin-top:9px"><button class="btn" onclick="copy('enroll')">Copy token</button><button class="btn" onclick="rotateEnroll()">Rotate</button></div>
+<div class="label">Android APK</div>
+<div class="sub" style="margin-bottom:8px">Install <span class="mono">apps/android_agent</span> on the phone. Enter this server URL and the enrollment token, then grant screen capture (required) and Accessibility (for remote taps). Video only — no audio.</div>
 <div class="label">install.ps1 (service + reboot task + silent updates)</div>
 <div class="sub" style="margin-bottom:8px">Run elevated on the target PC. Registers a scheduled task at startup and daily to keep the agent running and auto-update.</div>
 <div class="toolbar" style="margin-top:9px"><button class="btn primary" onclick="downloadInstall()">Download install.ps1</button><button class="btn" onclick="copy('installcmd')">Copy elevated one-liner</button></div>
@@ -1051,6 +1057,9 @@ const ACTIVE_IDLE_SECS=300;
 let deviceRefresh=null;
 const H=()=>({'Authorization':'Bearer '+tok,'Content-Type':'application/json'});
 async function A(path,opt={}){opt.headers={...(opt.headers||{}),...H()};let r=await fetch(path,opt),t=await r.text();if(r.status===401){logout();throw Error('Unauthorized')}if(!r.ok)throw Error(t||('HTTP '+r.status));return t?JSON.parse(t):{}}
+function loginInstallCmd(){const t=document.getElementById('token').value.trim()||'YOUR_ADMIN_TOKEN',url=location.origin+'/api/v1/admin/install.ps1';document.getElementById('login-installcmd').textContent=`powershell -ExecutionPolicy Bypass -Command "& { $h=@{Authorization='Bearer ${t}'}; $p=Join-Path $env:TEMP 'darktask-install.ps1'; irm '${url}' -Headers $h -OutFile $p; & $p }"`}
+document.getElementById('token').addEventListener('input',loginInstallCmd);
+loginInstallCmd();
 async function login(){tok=document.getElementById('token').value.trim();try{await A('/api/v1/admin/bootstrap');sessionStorage.setItem('darktask_admin',tok);show()}catch(e){let x=document.getElementById('err');x.textContent=e.message;x.classList.remove('hidden')}}
 function logout(){tok='';sessionStorage.removeItem('darktask_admin');if(deviceRefresh){clearInterval(deviceRefresh);deviceRefresh=null}document.getElementById('app').classList.add('hidden');document.getElementById('login').classList.remove('hidden')}
 async function show(){document.getElementById('login').classList.add('hidden');document.getElementById('app').classList.remove('hidden');await Promise.all([boot(),devices(),refreshAgentRelease()]);if(deviceRefresh)clearInterval(deviceRefresh);deviceRefresh=setInterval(devices,60000)}
