@@ -1,0 +1,8 @@
+<resources>
+    <string name="app_name">DarkTask</string>
+    <string name="a11y_description">Allows a DarkTask technician to tap, swipe, and press Back/Home on this device during an approved remote session. DarkTask does not read on-screen text.</string>
+    <string name="notif_channel">DarkTask agent</string>
+    <string name="notif_title">DarkTask agent</string>
+    <string name="notif_text">Waiting for a remote session</string>
+    <string name="notif_session">Remote session active</string>
+</resources>
