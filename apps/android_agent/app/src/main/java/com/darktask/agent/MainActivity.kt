@@ -66,7 +66,25 @@ class MainActivity : Activity() {
         if (Build.VERSION.SDK_INT >= 33) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
         }
+        consumeEnrollUri(intent)
         if (prefs.enrolled) startAgent()
+    }
+
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        consumeEnrollUri(intent)
+    }
+
+    private fun consumeEnrollUri(intent: Intent?) {
+        val data = intent?.data ?: return
+        if (data.scheme != "darktask" || data.host != "enroll") return
+        val srv = data.getQueryParameter("server")?.trim().orEmpty()
+        val tok = data.getQueryParameter("token")?.trim().orEmpty()
+        if (srv.isEmpty() || tok.isEmpty()) return
+        server.setText(srv)
+        token.setText(tok)
+        enrollAndStart()
     }
 
     override fun onResume() {

@@ -44,7 +44,7 @@ adb install -r app\build\outputs\apk\debug\app-debug.apk
 
 1. Install the APK.
 2. Paste the server URL and enrollment token from the admin portal.
-3. Tap **Enroll and start**.
+3. Tap **Enroll and start**, or scan the admin **Enroll** QR (`darktask://enroll?...`).
 4. Allow screen capture.
 5. Enable **DarkTask** under Accessibility (for remote taps).
 

@@ -73,6 +73,10 @@ struct AdminBootstrap {
     server_url: String,
     install_ps1_url: String,
     install_command: String,
+    android_page_url: String,
+    android_download_url: String,
+    android_qr_svg: String,
+    enroll_qr_svg: String,
 }
 
 #[derive(Serialize)]
@@ -136,6 +140,51 @@ fn agent_version_file() -> PathBuf {
         .unwrap_or_else(|| secret_dir().join("remote-agent.version"))
 }
 
+fn android_apk_path() -> PathBuf {
+    std::env::var_os("REMOTE_ANDROID_APK")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| secret_dir().join("darktask.apk"))
+}
+
+fn android_version_file() -> PathBuf {
+    android_apk_path()
+        .parent()
+        .map(|p| p.join("darktask-android.version"))
+        .unwrap_or_else(|| secret_dir().join("darktask-android.version"))
+}
+
+fn android_version_string() -> String {
+    if let Ok(raw) = fs::read_to_string(android_version_file()) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+fn url_encode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn qr_svg(payload: &str) -> Result<String, String> {
+    let code = qrcode::QrCode::new(payload.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(code
+        .render::<qrcode::render::svg::Color>()
+        .min_dimensions(180, 180)
+        .dark_color(qrcode::render::svg::Color("#11151D"))
+        .light_color(qrcode::render::svg::Color("#EEF2F7"))
+        .quiet_zone(true)
+        .build())
+}
+
 fn agent_version_string() -> String {
     if let Ok(raw) = fs::read_to_string(agent_version_file()) {
         let trimmed = raw.trim();
@@ -190,6 +239,70 @@ async fn write_agent_binary(bytes: &[u8], version: Option<&str>) -> Result<(), S
         .unwrap_or_else(|| format!("upload-{}", now_ms() / 1000));
     fs::write(agent_version_file(), format!("{version_text}\n")).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+fn validate_android_apk(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() < MIN_AGENT_BYTES {
+        return Err(format!(
+            "file too small ({} bytes); expected a DarkTask APK",
+            bytes.len()
+        ));
+    }
+    if bytes.len() > MAX_AGENT_BYTES {
+        return Err(format!(
+            "file too large ({} bytes); limit is {} MB",
+            bytes.len(),
+            MAX_AGENT_BYTES / (1024 * 1024)
+        ));
+    }
+    if bytes.get(0..2) != Some(b"PK") {
+        return Err("not an APK (missing ZIP/PK header)".into());
+    }
+    Ok(())
+}
+
+async fn write_android_apk(bytes: &[u8], version: Option<&str>) -> Result<(), String> {
+    validate_android_apk(bytes)?;
+    let path = android_apk_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let tmp = path.with_extension("upload.tmp");
+    tokio::fs::write(&tmp, bytes)
+        .await
+        .map_err(|e| format!("write temp apk: {e}"))?;
+    tokio::fs::rename(&tmp, &path)
+        .await
+        .map_err(|e| format!("publish apk: {e}"))?;
+    let version_text = version
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("upload-{}", now_ms() / 1000));
+    fs::write(android_version_file(), format!("{version_text}\n")).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn android_release_info() -> Result<AdminAgentRelease, String> {
+    let path = android_apk_path();
+    if !path.is_file() {
+        return Ok(AdminAgentRelease {
+            deployed: false,
+            version: android_version_string(),
+            sha256: String::new(),
+            download_url: "/api/v1/android/download".into(),
+            size_bytes: 0,
+        });
+    }
+    let meta = fs::metadata(&path).map_err(|e| e.to_string())?;
+    let sha256 = file_sha256_hex(&path).map_err(|e| e.to_string())?;
+    Ok(AdminAgentRelease {
+        deployed: true,
+        version: android_version_string(),
+        sha256,
+        download_url: "/api/v1/android/download".into(),
+        size_bytes: meta.len(),
+    })
 }
 
 fn agent_release_info() -> Result<AdminAgentRelease, String> {
@@ -445,9 +558,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/admin/install.ps1", get(admin_install_ps1))
         .route("/api/v1/admin/agent/release", get(admin_agent_release))
         .route("/api/v1/admin/agent/upload", post(admin_upload_agent))
+        .route("/api/v1/admin/android/release", get(admin_android_release))
+        .route("/api/v1/admin/android/upload", post(admin_upload_android))
         .route("/api/v1/agent/latest", get(agent_latest))
         .route("/api/v1/agent/download", get(agent_download))
         .route("/api/v1/agent/maintenance.ps1", get(agent_maintenance_ps1))
+        .route("/api/v1/android/download", get(android_download))
+        .route("/android", get(android_install_page))
         .route("/ws/agent", get(agent_ws))
         .route("/ws/session/{session_id}", get(session_ws))
         .layer(CorsLayer::permissive())
@@ -481,6 +598,15 @@ async fn admin_bootstrap(
         admin = current_admin_token(&state),
         install_ps1_url = install_ps1_url,
     );
+    let android_page_url = format!("{server_url}/android");
+    let android_download_url = format!("{server_url}/api/v1/android/download");
+    let enroll_uri = format!(
+        "darktask://enroll?server={}&token={}",
+        url_encode(&server_url),
+        url_encode(&enrollment_token),
+    );
+    let android_qr_svg = qr_svg(&android_page_url).unwrap_or_default();
+    let enroll_qr_svg = qr_svg(&enroll_uri).unwrap_or_default();
     Ok(Json(AdminBootstrap {
         agent_command: format!(
             r#"powershell -ExecutionPolicy Bypass -File .\install.ps1 -Server "{server_url}" -EnrollToken "{enrollment_token}""#,
@@ -489,6 +615,10 @@ async fn admin_bootstrap(
         server_url: server_url.clone(),
         install_ps1_url,
         install_command,
+        android_page_url,
+        android_download_url,
+        android_qr_svg,
+        enroll_qr_svg,
     }))
 }
 
@@ -623,7 +753,88 @@ async fn agent_download() -> Result<Response, (StatusCode, String)> {
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?)
 }
 
-async fn agent_maintenance_ps1() -> Response {
+async fn admin_android_release(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<AdminAgentRelease>, (StatusCode, String)> {
+    require_admin(&headers, &state)?;
+    android_release_info().map(Json).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+async fn admin_upload_android(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> Result<Json<AgentRelease>, (StatusCode, String)> {
+    require_admin(&headers, &state)?;
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut version: Option<String> = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("multipart read failed: {e}")))?
+    {
+        match field.name() {
+            Some("file") => {
+                bytes = field
+                    .bytes()
+                    .await
+                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("read upload: {e}")))?
+                    .to_vec();
+            }
+            Some("version") => {
+                version = Some(
+                    field
+                        .text()
+                        .await
+                        .map_err(|e| (StatusCode::BAD_REQUEST, format!("read version: {e}")))?,
+                );
+            }
+            _ => {}
+        }
+    }
+    if bytes.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "missing file field".into()));
+    }
+    write_android_apk(&bytes, version.as_deref())
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let info = android_release_info().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    info!(
+        version = %info.version,
+        sha256 = %info.sha256,
+        size_bytes = info.size_bytes,
+        "android apk uploaded from admin portal"
+    );
+    Ok(Json(AgentRelease {
+        version: info.version,
+        sha256: info.sha256,
+        download_url: info.download_url,
+    }))
+}
+
+async fn android_download() -> Result<Response, (StatusCode, String)> {
+    let path = android_apk_path();
+    if !path.is_file() {
+        return Err((StatusCode::NOT_FOUND, "android apk not deployed".into()));
+    }
+    let bytes = tokio::fs::read(&path).await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, format!("read apk: {e}"))
+    })?;
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/vnd.android.package-archive")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"darktask.apk\"",
+        )
+        .body(Body::from(bytes))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?)
+}
+
+async fn android_install_page() -> Html<&'static str> {
+    Html(ANDROID_INSTALL_HTML)
+}
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
@@ -975,6 +1186,26 @@ async fn session_socket(socket: WebSocket, state: AppState, session_id: Uuid, ro
     info!(%session_id, %role, "session peer disconnected");
 }
 
+const ANDROID_INSTALL_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Install DarkTask</title>
+<style>
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#090b10;color:#eef2f7;font:16px system-ui,-apple-system,Segoe UI,sans-serif}
+.wrap{max-width:420px;margin:0 auto;padding:36px 22px}h1{font-size:28px;margin:0 0 8px}.brand span{color:#61a8ff}
+p{color:#8c96a8;line-height:1.45}.btn{display:block;text-align:center;text-decoration:none;background:#edf1f7;color:#090b10;font-weight:700;border-radius:12px;padding:16px;margin-top:22px}
+.meta{font:12px ui-monospace,SFMono-Regular,Consolas,monospace;color:#8c96a8;margin-top:18px}
+</style></head>
+<body><div class="wrap">
+<div class="brand" style="font-size:22px;font-weight:800">Dark<span>Task</span></div>
+<h1>Android endpoint</h1>
+<p>Install the APK, then scan the <strong>Enroll</strong> QR from the admin console (or type the server URL and token in the app).</p>
+<p>Allow screen capture. Enable DarkTask under Accessibility for remote taps. Video only — no audio.</p>
+<a class="btn" href="/api/v1/android/download">Download DarkTask APK</a>
+<p class="meta">Unknown sources / Install unknown apps must be allowed for this browser.</p>
+</div></body></html>"#;
+
 const ADMIN_HTML: &str = r#"<!doctype html>
 <html lang="en">
 <head>
@@ -993,6 +1224,7 @@ button,input{font:inherit}.shell{max-width:1200px;margin:auto;padding:28px}.top{
 .mono{font:12px ui-monospace,SFMono-Regular,Consolas,monospace}.code{background:#090c12;border:1px solid var(--b);border-radius:10px;padding:12px;word-break:break-all}.label{color:var(--m);font-size:11px;text-transform:uppercase;letter-spacing:.08em;margin:15px 0 7px}
 .toolbar{display:flex;gap:8px}.login{max-width:min(720px,94vw);margin:14vh auto}.login .body{padding:26px}.login p{color:var(--m)}input{width:100%;padding:12px;background:#090c12;border:1px solid var(--b);border-radius:10px;color:var(--t)}
 .hidden{display:none!important}.empty{padding:28px;text-align:center;color:var(--m)}.notice{margin-top:12px;padding:11px;background:#101824;border:1px solid #203756;border-radius:10px;color:#afd0ff}
+.qrrow{display:flex;gap:16px;flex-wrap:wrap;margin-top:12px}.qrbox{width:176px}.qr{background:#eef2f7;border-radius:12px;padding:8px;min-height:160px}.qr svg{display:block;width:100%;height:auto}
 .viewer{position:fixed;right:24px;bottom:24px;width:min(900px,72vw);height:min(680px,72vh);background:#050608;z-index:1000;display:flex;flex-direction:column;border:1px solid var(--b);border-radius:14px;overflow:hidden;box-shadow:0 24px 80px #000a}.viewerbar{height:52px;background:#0d1118;border-bottom:1px solid var(--b);display:flex;align-items:center;gap:10px;padding:0 14px}.viewerbar .grow{flex:1}.stage{flex:1;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#000}.stage canvas{max-width:100%;max-height:100%;outline:none}.danger{color:#ff9aa4}.iconbtn{width:34px;height:34px;padding:0;display:inline-flex;align-items:center;justify-content:center;font-size:18px;line-height:1}.device-actions{display:flex;gap:7px;align-items:center}@media(max-width:900px){.viewer{right:10px;bottom:10px;width:calc(100vw - 20px);height:65vh}}@media(max-width:850px){.grid{grid-template-columns:1fr}.device{grid-template-columns:1fr auto}.hide-sm{display:none}}
 </style>
 </head>
@@ -1017,8 +1249,16 @@ button,input{font:inherit}.shell{max-width:1200px;margin:auto;padding:28px}.top{
 <div class="card"><div class="head"><h2>Enroll a device</h2></div><div class="body">
 <div class="label">Enrollment token</div><div id="enroll" class="code mono">—</div>
 <div class="toolbar" style="margin-top:9px"><button class="btn" onclick="copy('enroll')">Copy token</button><button class="btn" onclick="rotateEnroll()">Rotate</button></div>
-<div class="label">Android APK</div>
-<div class="sub" style="margin-bottom:8px">Install <span class="mono">apps/android_agent</span> on the phone. Enter this server URL and the enrollment token, then grant screen capture (required) and Accessibility (for remote taps). Video is H.264, no audio.</div>
+<div class="label">Android</div>
+<div class="sub" style="margin-bottom:8px">Scan <strong>Install</strong> with the phone camera, then scan <strong>Enroll</strong> after DarkTask is installed. Video is H.264, no audio.</div>
+<div class="qrrow"><div class="qrbox"><div class="label">1. Install</div><div id="apkqr" class="qr"></div><div class="sub" style="margin-top:6px">Opens the APK page</div></div><div class="qrbox"><div class="label">2. Enroll</div><div id="enrollqr" class="qr"></div><div class="sub" style="margin-top:6px">Opens DarkTask with server + token</div></div></div>
+<div class="toolbar" style="margin-top:12px"><button class="btn primary" onclick="downloadApk()">Download APK</button><button class="btn" onclick="copy('androidpage')">Copy install URL</button></div>
+<div id="androidpage" class="code mono" style="margin-top:9px">—</div>
+<div class="label">Current APK</div><div id="apkrelease" class="code mono">—</div>
+<input id="apkfile" type="file" accept=".apk,application/vnd.android.package-archive" style="margin-top:8px">
+<input id="apkversion" type="text" placeholder="Version label (optional)" style="margin-top:8px">
+<div class="toolbar" style="margin-top:9px"><button class="btn primary" onclick="uploadApk()">Upload APK</button></div>
+<div id="apkuploadmsg" class="notice hidden"></div>
 <div class="label">install.ps1 (service + reboot task + silent updates)</div>
 <div class="sub" style="margin-bottom:8px">Run elevated on the target PC. Registers a scheduled task at startup and daily to keep the agent running and auto-update.</div>
 <div class="toolbar" style="margin-top:9px"><button class="btn primary" onclick="downloadInstall()">Download install.ps1</button><button class="btn" onclick="copy('installcmd')">Copy elevated one-liner</button></div>
@@ -1062,8 +1302,11 @@ document.getElementById('token').addEventListener('input',loginInstallCmd);
 loginInstallCmd();
 async function login(){tok=document.getElementById('token').value.trim();try{await A('/api/v1/admin/bootstrap');sessionStorage.setItem('darktask_admin',tok);show()}catch(e){let x=document.getElementById('err');x.textContent=e.message;x.classList.remove('hidden')}}
 function logout(){tok='';sessionStorage.removeItem('darktask_admin');if(deviceRefresh){clearInterval(deviceRefresh);deviceRefresh=null}document.getElementById('app').classList.add('hidden');document.getElementById('login').classList.remove('hidden')}
-async function show(){document.getElementById('login').classList.add('hidden');document.getElementById('app').classList.remove('hidden');await Promise.all([boot(),devices(),refreshAgentRelease()]);if(deviceRefresh)clearInterval(deviceRefresh);deviceRefresh=setInterval(devices,60000)}
-async function boot(){let x=await A('/api/v1/admin/bootstrap');document.getElementById('enroll').textContent=x.enrollment_token;document.getElementById('command').textContent=x.agent_command;document.getElementById('installcmd').textContent=x.install_command;document.getElementById('server').textContent=x.server_url;window.__installPs1Url=x.install_ps1_url}
+async function show(){document.getElementById('login').classList.add('hidden');document.getElementById('app').classList.remove('hidden');await Promise.all([boot(),devices(),refreshAgentRelease(),refreshApkRelease()]);if(deviceRefresh)clearInterval(deviceRefresh);deviceRefresh=setInterval(devices,60000)}
+async function boot(){let x=await A('/api/v1/admin/bootstrap');document.getElementById('enroll').textContent=x.enrollment_token;document.getElementById('command').textContent=x.agent_command;document.getElementById('installcmd').textContent=x.install_command;document.getElementById('server').textContent=x.server_url;document.getElementById('androidpage').textContent=x.android_page_url;document.getElementById('apkqr').innerHTML=x.android_qr_svg||'';document.getElementById('enrollqr').innerHTML=x.enroll_qr_svg||'';window.__installPs1Url=x.install_ps1_url;window.__apkUrl=x.android_download_url}
+async function refreshApkRelease(){try{let x=await A('/api/v1/admin/android/release');document.getElementById('apkrelease').textContent=x.deployed?`v${x.version}  ·  ${(x.size_bytes/1024/1024).toFixed(2)} MB  ·  sha256 ${x.sha256.slice(0,16)}…`:'Not deployed — upload darktask.apk below.'}catch(e){document.getElementById('apkrelease').textContent='Unable to load APK info.'}}
+async function uploadApk(){const msg=document.getElementById('apkuploadmsg');msg.classList.add('hidden');const f=document.getElementById('apkfile').files[0];if(!f){alert('Choose the DarkTask APK first.');return}if(!confirm(`Upload ${f.name} (${(f.size/1024/1024).toFixed(2)} MB) as the Android client?`))return;try{const fd=new FormData();fd.append('file',f,f.name);const v=document.getElementById('apkversion').value.trim();if(v)fd.append('version',v);const r=await fetch('/api/v1/admin/android/upload',{method:'POST',headers:{Authorization:'Bearer '+tok},body:fd});const t=await r.text();if(r.status===401){logout();throw Error('Unauthorized')}if(!r.ok)throw Error(t||('HTTP '+r.status));msg.textContent='APK uploaded. Phones can scan Install or use Download APK.';msg.classList.remove('hidden');document.getElementById('apkfile').value='';await refreshApkRelease()}catch(e){alert(e.message)}}
+function downloadApk(){window.open(window.__apkUrl||'/api/v1/android/download','_blank')}
 async function refreshAgentRelease(){try{let x=await A('/api/v1/admin/agent/release');document.getElementById('agentrelease').textContent=x.deployed?`v${x.version}  ·  ${(x.size_bytes/1024/1024).toFixed(2)} MB  ·  sha256 ${x.sha256.slice(0,16)}…`:'Not deployed — upload remote-agent.exe below.'}catch(e){document.getElementById('agentrelease').textContent='Unable to load release info.'}}
 async function uploadAgent(){const msg=document.getElementById('agentuploadmsg');msg.classList.add('hidden');const f=document.getElementById('agentfile').files[0];if(!f){alert('Choose remote-agent.exe first.');return}if(!confirm(`Upload ${f.name} (${(f.size/1024/1024).toFixed(2)} MB) as the new agent release?`))return;try{const fd=new FormData();fd.append('file',f,f.name);const v=document.getElementById('agentversion').value.trim();if(v)fd.append('version',v);const r=await fetch('/api/v1/admin/agent/upload',{method:'POST',headers:{Authorization:'Bearer '+tok},body:fd});const t=await r.text();if(r.status===401){logout();throw Error('Unauthorized')}if(!r.ok)throw Error(t||('HTTP '+r.status));msg.textContent='Agent uploaded. Endpoints will pick this up on install or next maintenance run.';msg.classList.remove('hidden');document.getElementById('agentfile').value='';await refreshAgentRelease()}catch(e){alert(e.message)}}
 async function downloadInstall(){try{let r=await fetch(window.__installPs1Url||'/api/v1/admin/install.ps1',{headers:{Authorization:'Bearer '+tok}});if(r.status===401){logout();throw Error('Unauthorized')}if(!r.ok)throw Error(await r.text()||('HTTP '+r.status));let blob=await r.blob();let a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='install.ps1';a.click();URL.revokeObjectURL(a.href)}catch(e){alert(e.message)}}
