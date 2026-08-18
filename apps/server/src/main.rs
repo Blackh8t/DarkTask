@@ -1,10 +1,12 @@
 use axum::{
+    body::Body,
     extract::{
+        multipart::Multipart,
         ws::{Message, WebSocket, WebSocketUpgrade},
         Path, Query, State,
     },
-    http::{HeaderMap, StatusCode},
-    response::{Html, IntoResponse},
+    http::{header, HeaderMap, StatusCode},
+    response::{Html, IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
@@ -34,6 +36,10 @@ use std::os::unix::fs::PermissionsExt;
 
 const DEFAULT_DB: &str = "/var/lib/darktask/darktask.db";
 const DEFAULT_SECRET_DIR: &str = "/var/lib/darktask";
+const INSTALL_PS1_TEMPLATE: &str = include_str!("../../../scripts/install.ps1");
+const MAINTENANCE_PS1: &str = include_str!("../../../scripts/agent-maintenance.ps1");
+const MIN_AGENT_BYTES: usize = 64 * 1024;
+const MAX_AGENT_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone)]
 struct DeviceRecord {
@@ -65,6 +71,24 @@ struct AdminBootstrap {
     enrollment_token: String,
     agent_command: String,
     server_url: String,
+    install_ps1_url: String,
+    install_command: String,
+}
+
+#[derive(Serialize)]
+struct AgentRelease {
+    version: String,
+    sha256: String,
+    download_url: String,
+}
+
+#[derive(Serialize)]
+struct AdminAgentRelease {
+    deployed: bool,
+    version: String,
+    sha256: String,
+    download_url: String,
+    size_bytes: u64,
 }
 
 #[derive(Serialize)]
@@ -97,6 +121,102 @@ fn secret_dir() -> PathBuf {
     std::env::var_os("REMOTE_SECRET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_SECRET_DIR))
+}
+
+fn agent_exe_path() -> PathBuf {
+    std::env::var_os("REMOTE_AGENT_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| secret_dir().join("remote-agent.exe"))
+}
+
+fn agent_version_file() -> PathBuf {
+    agent_exe_path()
+        .parent()
+        .map(|p| p.join("remote-agent.version"))
+        .unwrap_or_else(|| secret_dir().join("remote-agent.version"))
+}
+
+fn agent_version_string() -> String {
+    if let Ok(raw) = fs::read_to_string(agent_version_file()) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    std::env::var("REMOTE_AGENT_VERSION")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+}
+
+fn validate_agent_binary(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() < MIN_AGENT_BYTES {
+        return Err(format!(
+            "file too small ({} bytes); expected a Windows agent executable",
+            bytes.len()
+        ));
+    }
+    if bytes.len() > MAX_AGENT_BYTES {
+        return Err(format!(
+            "file too large ({} bytes); limit is {} MB",
+            bytes.len(),
+            MAX_AGENT_BYTES / (1024 * 1024)
+        ));
+    }
+    if bytes.get(0..2) != Some(b"MZ") {
+        return Err("not a Windows PE executable (missing MZ header)".into());
+    }
+    Ok(())
+}
+
+async fn write_agent_binary(bytes: &[u8], version: Option<&str>) -> Result<(), String> {
+    validate_agent_binary(bytes)?;
+    let path = agent_exe_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let tmp = path.with_extension("upload.tmp");
+    tokio::fs::write(&tmp, bytes)
+        .await
+        .map_err(|e| format!("write temp agent: {e}"))?;
+    tokio::fs::rename(&tmp, &path)
+        .await
+        .map_err(|e| format!("publish agent binary: {e}"))?;
+
+    let version_text = version
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("upload-{}", now_ms() / 1000));
+    fs::write(agent_version_file(), format!("{version_text}\n")).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn agent_release_info() -> Result<AdminAgentRelease, String> {
+    let path = agent_exe_path();
+    if !path.is_file() {
+        return Ok(AdminAgentRelease {
+            deployed: false,
+            version: agent_version_string(),
+            sha256: String::new(),
+            download_url: "/api/v1/agent/download".into(),
+            size_bytes: 0,
+        });
+    }
+    let meta = fs::metadata(&path).map_err(|e| e.to_string())?;
+    let sha256 = file_sha256_hex(&path).map_err(|e| e.to_string())?;
+    Ok(AdminAgentRelease {
+        deployed: true,
+        version: agent_version_string(),
+        sha256,
+        download_url: "/api/v1/agent/download".into(),
+        size_bytes: meta.len(),
+    })
+}
+
+fn file_sha256_hex(path: &FsPath) -> anyhow::Result<String> {
+    let bytes = fs::read(path)?;
+    Ok(hex::encode(Sha256::digest(bytes)))
 }
 
 fn secret_file(dir: &FsPath, name: &str) -> PathBuf {
@@ -196,6 +316,7 @@ fn load_devices(conn: &Connection) -> anyhow::Result<DashMap<Uuid, DeviceRecord>
                     agent_version,
                     online: false,
                     last_seen_unix_ms: last_seen as u64,
+                    session_peek: None,
                 },
                 device_token_hash,
             },
@@ -321,6 +442,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/admin/bootstrap", get(admin_bootstrap))
         .route("/api/v1/admin/token/enroll", post(rotate_enroll_token))
         .route("/api/v1/admin/token/admin", post(rotate_admin_token))
+        .route("/api/v1/admin/install.ps1", get(admin_install_ps1))
+        .route("/api/v1/admin/agent/release", get(admin_agent_release))
+        .route("/api/v1/admin/agent/upload", post(admin_upload_agent))
+        .route("/api/v1/agent/latest", get(agent_latest))
+        .route("/api/v1/agent/download", get(agent_download))
+        .route("/api/v1/agent/maintenance.ps1", get(agent_maintenance_ps1))
         .route("/ws/agent", get(agent_ws))
         .route("/ws/session/{session_id}", get(session_ws))
         .layer(CorsLayer::permissive())
@@ -348,14 +475,164 @@ async fn admin_bootstrap(
     require_admin(&headers, &state)?;
     let server_url = public_server_url(&headers);
     let enrollment_token = current_enroll_token(&state);
+    let install_ps1_url = format!("{server_url}/api/v1/admin/install.ps1");
+    let install_command = format!(
+        r#"powershell -ExecutionPolicy Bypass -Command "& {{ $h=@{{Authorization='Bearer {admin}'}}; $p=Join-Path $env:TEMP 'darktask-install.ps1'; Invoke-WebRequest -Uri '{install_ps1_url}' -Headers $h -OutFile $p; & $p }}""#,
+        admin = current_admin_token(&state),
+        install_ps1_url = install_ps1_url,
+    );
     Ok(Json(AdminBootstrap {
         agent_command: format!(
-            r#".\remote-agent.exe --server "{}" --enroll "{}""#,
-            server_url, enrollment_token
+            r#"powershell -ExecutionPolicy Bypass -File .\install.ps1 -Server "{server_url}" -EnrollToken "{enrollment_token}""#,
         ),
         enrollment_token,
-        server_url,
+        server_url: server_url.clone(),
+        install_ps1_url,
+        install_command,
     }))
+}
+
+async fn admin_install_ps1(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Response, (StatusCode, String)> {
+    require_admin(&headers, &state)?;
+    let server_url = public_server_url(&headers);
+    let enrollment_token = current_enroll_token(&state);
+    let script = INSTALL_PS1_TEMPLATE
+        .replace("__DARKTASK_SERVER__", &server_url)
+        .replace("__DARKTASK_ENROLL__", &enrollment_token);
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"install.ps1\"",
+        )
+        .body(Body::from(script))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?)
+}
+
+async fn admin_agent_release(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<AdminAgentRelease>, (StatusCode, String)> {
+    require_admin(&headers, &state)?;
+    admin_agent_release_info().map(Json).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+fn admin_agent_release_info() -> Result<AdminAgentRelease, String> {
+    agent_release_info()
+}
+
+async fn admin_upload_agent(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> Result<Json<AgentRelease>, (StatusCode, String)> {
+    require_admin(&headers, &state)?;
+
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut version: Option<String> = None;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("multipart read failed: {e}")))?
+    {
+        match field.name() {
+            Some("file") => {
+                bytes = field
+                    .bytes()
+                    .await
+                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("read upload: {e}")))?
+                    .to_vec();
+            }
+            Some("version") => {
+                version = Some(
+                    field
+                        .text()
+                        .await
+                        .map_err(|e| (StatusCode::BAD_REQUEST, format!("read version: {e}")))?,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    if bytes.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "missing file field".into()));
+    }
+
+    write_agent_binary(&bytes, version.as_deref())
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+    let info = agent_release_info().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    info!(
+        version = %info.version,
+        sha256 = %info.sha256,
+        size_bytes = info.size_bytes,
+        "agent binary uploaded from admin portal"
+    );
+
+    Ok(Json(AgentRelease {
+        version: info.version,
+        sha256: info.sha256,
+        download_url: info.download_url,
+    }))
+}
+
+async fn agent_latest() -> Result<Json<AgentRelease>, (StatusCode, String)> {
+    let path = agent_exe_path();
+    if !path.is_file() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                "agent binary not deployed (set REMOTE_AGENT_EXE or place remote-agent.exe in {})",
+                path.display()
+            ),
+        ));
+    }
+    let sha256 = file_sha256_hex(&path).map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, format!("hash agent binary: {e}"))
+    })?;
+    Ok(Json(AgentRelease {
+        version: agent_version_string(),
+        sha256,
+        download_url: "/api/v1/agent/download".into(),
+    }))
+}
+
+async fn agent_download() -> Result<Response, (StatusCode, String)> {
+    let path = agent_exe_path();
+    if !path.is_file() {
+        return Err((StatusCode::NOT_FOUND, "agent binary not deployed".into()));
+    }
+    let bytes = tokio::fs::read(&path).await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, format!("read agent binary: {e}"))
+    })?;
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"remote-agent.exe\"",
+        )
+        .body(Body::from(bytes))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?)
+}
+
+async fn agent_maintenance_ps1() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"agent-maintenance.ps1\"",
+        )
+        .body(Body::from(MAINTENANCE_PS1))
+        .unwrap()
 }
 
 async fn rotate_enroll_token(
@@ -407,6 +684,7 @@ async fn enroll(
         agent_version: req.agent_version,
         online: false,
         last_seen_unix_ms: now_ms(),
+        session_peek: None,
     };
 
     {
@@ -439,7 +717,7 @@ async fn enroll(
     Ok(Json(EnrollResponse {
         device_id,
         device_token,
-        heartbeat_interval_secs: 10,
+        heartbeat_interval_secs: 60,
     }))
 }
 
@@ -526,6 +804,7 @@ async fn request_session(
         session_id,
         controller_id: req.controller_id,
         session_token: session_token.clone(),
+        session_mode: req.session_mode,
     })
     .map_err(|_| (StatusCode::GONE, "agent connection closed".into()))?;
 
@@ -577,6 +856,7 @@ async fn agent_socket(socket: WebSocket, state: AppState) {
                 if let Some(mut record) = state.devices.get_mut(&hb.device_id) {
                     record.summary.online = true;
                     record.summary.last_seen_unix_ms = hb.unix_ms;
+                    record.summary.session_peek = hb.session_peek.clone();
                     if let Ok(db) = state.db.lock() {
                         let _ = db.execute(
                             "UPDATE devices SET last_seen_unix_ms=?1, hostname=?2, agent_version=?3 WHERE device_id=?4",
@@ -616,6 +896,7 @@ async fn agent_socket(socket: WebSocket, state: AppState) {
         if let Some(mut record) = state.devices.get_mut(&device_id) {
             record.summary.online = false;
             record.summary.last_seen_unix_ms = now_ms();
+            record.summary.session_peek = None;
         }
         info!(%device_id, "agent offline");
     }
@@ -705,7 +986,8 @@ const ADMIN_HTML: &str = r#"<!doctype html>
 button,input{font:inherit}.shell{max-width:1200px;margin:auto;padding:28px}.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px}
 .brand{font-size:24px;font-weight:800}.brand span{color:var(--blue)}.sub,.meta{color:var(--m);font-size:12px}.grid{display:grid;grid-template-columns:1.7fr 1fr;gap:18px}
 .card{background:var(--p);border:1px solid var(--b);border-radius:16px;overflow:hidden}.head{padding:16px 18px;border-bottom:1px solid var(--b);display:flex;justify-content:space-between;align-items:center}.head h2{margin:0;font-size:14px}.body{padding:18px}
-.device{display:grid;grid-template-columns:1.4fr 1fr .7fr auto;gap:14px;align-items:center;padding:15px 18px;border-bottom:1px solid var(--b)}.host{font-weight:700}
+.device{display:grid;grid-template-columns:1.4fr 1fr .95fr .7fr auto;gap:14px;align-items:center;padding:15px 18px;border-bottom:1px solid var(--b)}.host{font-weight:700}
+.peek{font-size:12px;line-height:1.35}.peek.active{color:var(--g)}.peek.idle{color:var(--m)}.peek.none{color:#687184}
 .status{display:flex;align-items:center;gap:7px}.dot{width:8px;height:8px;border-radius:50%;background:#687184}.online .dot{background:var(--g);box-shadow:0 0 12px #36d17c66}
 .btn{border:1px solid var(--b);background:var(--p2);color:var(--t);border-radius:9px;padding:9px 12px;cursor:pointer}.btn.primary{background:#edf1f7;color:#090b10;font-weight:700}.btn:disabled{opacity:.4;cursor:not-allowed}
 .mono{font:12px ui-monospace,SFMono-Regular,Consolas,monospace}.code{background:#090c12;border:1px solid var(--b);border-radius:10px;padding:12px;word-break:break-all}.label{color:var(--m);font-size:11px;text-transform:uppercase;letter-spacing:.08em;margin:15px 0 7px}
@@ -726,12 +1008,25 @@ button,input{font:inherit}.shell{max-width:1200px;margin:auto;padding:28px}.top{
 <div class="top"><div><div class="brand">Dark<span>Task</span></div><div class="sub">Managed remote access</div></div>
 <div class="toolbar"><div id="server" class="sub"></div><button class="btn" onclick="logout()">Lock</button></div></div>
 <div class="grid">
-<div class="card"><div class="head"><h2>Devices</h2><button class="btn" onclick="devices()">Refresh</button></div><div id="devices"><div class="empty">Loading…</div></div></div>
+<div class="card"><div class="head"><h2>Devices</h2><button class="btn" onclick="devices()">Refresh</button></div><div id="devices"><div class="empty">Loading…</div></div><div class="sub" style="padding:10px 18px 14px;border-top:1px solid var(--b)">Session peek updates every 60s · active = input within 5 minutes</div></div>
 <div>
 <div class="card"><div class="head"><h2>Enroll a device</h2></div><div class="body">
 <div class="label">Enrollment token</div><div id="enroll" class="code mono">—</div>
 <div class="toolbar" style="margin-top:9px"><button class="btn" onclick="copy('enroll')">Copy token</button><button class="btn" onclick="rotateEnroll()">Rotate</button></div>
-<div class="label">Windows command</div><div id="command" class="code mono">—</div><button class="btn" style="margin-top:9px" onclick="copy('command')">Copy command</button>
+<div class="label">install.ps1 (service + reboot task + silent updates)</div>
+<div class="sub" style="margin-bottom:8px">Run elevated on the target PC. Registers a scheduled task at startup and daily to keep the agent running and auto-update.</div>
+<div class="toolbar" style="margin-top:9px"><button class="btn primary" onclick="downloadInstall()">Download install.ps1</button><button class="btn" onclick="copy('installcmd')">Copy elevated one-liner</button></div>
+<div class="label">Elevated one-liner</div><div id="installcmd" class="code mono">—</div>
+<div class="label">Manual install (script already downloaded)</div><div id="command" class="code mono">—</div><button class="btn" style="margin-top:9px" onclick="copy('command')">Copy manual command</button>
+</div></div>
+<div class="card" style="margin-top:18px"><div class="head"><h2>Agent release</h2></div><div class="body">
+<div class="sub">Upload <span class="mono">remote-agent.exe</span> here. Endpoints install and silently update from this file.</div>
+<div class="label">Current release</div><div id="agentrelease" class="code mono">—</div>
+<div class="label">Upload new agent</div>
+<input id="agentfile" type="file" accept=".exe,application/octet-stream,application/x-msdownload">
+<input id="agentversion" type="text" placeholder="Version label (optional, e.g. 0.3.1)" style="margin-top:8px">
+<div class="toolbar" style="margin-top:9px"><button class="btn primary" onclick="uploadAgent()">Upload agent</button><button class="btn" onclick="refreshAgentRelease()">Refresh</button></div>
+<div id="agentuploadmsg" class="notice hidden"></div>
 </div></div>
 <div class="card" style="margin-top:18px"><div class="head"><h2>Security</h2></div><div class="body">
 <div class="sub">Rotate the admin token if it has been exposed.</div><button class="btn" style="margin-top:12px" onclick="rotateAdmin()">Rotate admin token</button><div id="newadmin" class="notice hidden"></div>
@@ -750,17 +1045,22 @@ button,input{font:inherit}.shell{max-width:1200px;margin:auto;padding:28px}.top{
   <div class="stage"><canvas id="screen" tabindex="0"></canvas></div>
 </div>
 
-<script src="https://cdn.jsdelivr.net/npm/fzstd@0.1.1/umd/index.js"></script>
-
 <script>
 let tok=sessionStorage.getItem('darktask_admin')||'';
+const ACTIVE_IDLE_SECS=300;
+let deviceRefresh=null;
 const H=()=>({'Authorization':'Bearer '+tok,'Content-Type':'application/json'});
 async function A(path,opt={}){opt.headers={...(opt.headers||{}),...H()};let r=await fetch(path,opt),t=await r.text();if(r.status===401){logout();throw Error('Unauthorized')}if(!r.ok)throw Error(t||('HTTP '+r.status));return t?JSON.parse(t):{}}
 async function login(){tok=document.getElementById('token').value.trim();try{await A('/api/v1/admin/bootstrap');sessionStorage.setItem('darktask_admin',tok);show()}catch(e){let x=document.getElementById('err');x.textContent=e.message;x.classList.remove('hidden')}}
-function logout(){tok='';sessionStorage.removeItem('darktask_admin');document.getElementById('app').classList.add('hidden');document.getElementById('login').classList.remove('hidden')}
-async function show(){document.getElementById('login').classList.add('hidden');document.getElementById('app').classList.remove('hidden');await Promise.all([boot(),devices()])}
-async function boot(){let x=await A('/api/v1/admin/bootstrap');document.getElementById('enroll').textContent=x.enrollment_token;document.getElementById('command').textContent=x.agent_command;document.getElementById('server').textContent=x.server_url}
-async function devices(){let a=await A('/api/v1/devices'),r=document.getElementById('devices');if(!a.length){r.innerHTML='<div class="empty">No enrolled devices</div>';return}r.innerHTML=a.map(d=>`<div class="device"><div><div class="host">${E(d.hostname)}</div><div class="meta mono">${E(d.device_id)}</div></div><div class="hide-sm">${E(d.platform)} / ${E(d.arch)}<div class="meta">Agent ${E(d.agent_version)}</div></div><div class="status ${d.online?'online':''}"><span class="dot"></span>${d.online?'Online':'Offline'}</div><div class="device-actions"><button class="btn primary" ${d.online?'':'disabled'} onclick="connect('${d.device_id}','${EA(d.hostname)}')">Connect</button><button class="btn danger iconbtn" title="Delete client" aria-label="Delete client" onclick="deleteDevice('${d.device_id}','${EA(d.hostname)}')">×</button></div></div><div id="s-${d.device_id}" class="hidden"></div>`).join('')}
+function logout(){tok='';sessionStorage.removeItem('darktask_admin');if(deviceRefresh){clearInterval(deviceRefresh);deviceRefresh=null}document.getElementById('app').classList.add('hidden');document.getElementById('login').classList.remove('hidden')}
+async function show(){document.getElementById('login').classList.add('hidden');document.getElementById('app').classList.remove('hidden');await Promise.all([boot(),devices(),refreshAgentRelease()]);if(deviceRefresh)clearInterval(deviceRefresh);deviceRefresh=setInterval(devices,60000)}
+async function boot(){let x=await A('/api/v1/admin/bootstrap');document.getElementById('enroll').textContent=x.enrollment_token;document.getElementById('command').textContent=x.agent_command;document.getElementById('installcmd').textContent=x.install_command;document.getElementById('server').textContent=x.server_url;window.__installPs1Url=x.install_ps1_url}
+async function refreshAgentRelease(){try{let x=await A('/api/v1/admin/agent/release');document.getElementById('agentrelease').textContent=x.deployed?`v${x.version}  ·  ${(x.size_bytes/1024/1024).toFixed(2)} MB  ·  sha256 ${x.sha256.slice(0,16)}…`:'Not deployed — upload remote-agent.exe below.'}catch(e){document.getElementById('agentrelease').textContent='Unable to load release info.'}}
+async function uploadAgent(){const msg=document.getElementById('agentuploadmsg');msg.classList.add('hidden');const f=document.getElementById('agentfile').files[0];if(!f){alert('Choose remote-agent.exe first.');return}if(!confirm(`Upload ${f.name} (${(f.size/1024/1024).toFixed(2)} MB) as the new agent release?`))return;try{const fd=new FormData();fd.append('file',f,f.name);const v=document.getElementById('agentversion').value.trim();if(v)fd.append('version',v);const r=await fetch('/api/v1/admin/agent/upload',{method:'POST',headers:{Authorization:'Bearer '+tok},body:fd});const t=await r.text();if(r.status===401){logout();throw Error('Unauthorized')}if(!r.ok)throw Error(t||('HTTP '+r.status));msg.textContent='Agent uploaded. Endpoints will pick this up on install or next maintenance run.';msg.classList.remove('hidden');document.getElementById('agentfile').value='';await refreshAgentRelease()}catch(e){alert(e.message)}}
+async function downloadInstall(){try{let r=await fetch(window.__installPs1Url||'/api/v1/admin/install.ps1',{headers:{Authorization:'Bearer '+tok}});if(r.status===401){logout();throw Error('Unauthorized')}if(!r.ok)throw Error(await r.text()||('HTTP '+r.status));let blob=await r.blob();let a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='install.ps1';a.click();URL.revokeObjectURL(a.href)}catch(e){alert(e.message)}}
+function fmtDuration(secs){if(secs<60)return secs+'s';const m=Math.floor(secs/60);if(m<60)return m+'m';return Math.floor(m/60)+'h '+(m%60)+'m'}
+function sessionPeek(d){if(!d.online||!d.session_peek)return{text:'—',cls:'none'};const p=d.session_peek;if(!p.user_logged_in)return{text:'No user session',cls:'none'};if(p.idle_secs==null)return{text:'Logged in',cls:'active'};if(p.idle_secs<60)return{text:'Active now',cls:'active'};if(p.idle_secs<ACTIVE_IDLE_SECS)return{text:'Used '+fmtDuration(p.idle_secs)+' ago',cls:'active'};return{text:'Idle · '+fmtDuration(p.idle_secs),cls:'idle'}}
+async function devices(){let a=await A('/api/v1/devices'),r=document.getElementById('devices');if(!a.length){r.innerHTML='<div class="empty">No enrolled devices</div>';return}r.innerHTML=a.map(d=>{const peek=sessionPeek(d);return `<div class="device"><div><div class="host">${E(d.hostname)}</div><div class="meta mono">${E(d.device_id)}</div></div><div class="hide-sm">${E(d.platform)} / ${E(d.arch)}<div class="meta">Agent ${E(d.agent_version)}</div></div><div class="peek ${peek.cls}">${E(peek.text)}</div><div class="status ${d.online?'online':''}"><span class="dot"></span>${d.online?'Online':'Offline'}</div><div class="device-actions"><button class="btn primary" ${d.online?'':'disabled'} onclick="connect('${d.device_id}','${EA(d.hostname)}')">Connect</button><button class="btn danger iconbtn" title="Delete client" aria-label="Delete client" onclick="deleteDevice('${d.device_id}','${EA(d.hostname)}')">×</button></div></div><div id="s-${d.device_id}" class="hidden"></div>`}).join('')}
 let sessionSocket=null,sessionPing=null,lastMove=0;
 const canvas=document.getElementById('screen'),ctx=canvas.getContext('2d',{alpha:false});
 async function deleteDevice(id,host){
@@ -779,10 +1079,10 @@ async function connect(id,host){try{let s=await A('/api/v1/devices/'+id+'/sessio
 function wsBase(){return (location.protocol==='https:'?'wss://':'ws://')+location.host}
 function openViewer(host,s){disconnectViewer();document.getElementById('viewer').classList.remove('hidden');document.getElementById('viewerHost').textContent=host;let st=document.getElementById('viewerState');st.textContent='Connecting…';let ws=new WebSocket(wsBase()+'/ws/session/'+encodeURIComponent(s.session_id)+'?role=controller&token='+encodeURIComponent(s.session_token));sessionSocket=ws;ws.binaryType='arraybuffer';ws.onopen=()=>{st.textContent='Connected';sessionPing=setInterval(()=>sendControl({type:'ping',data:{unix_ms:Date.now()}}),5000)};ws.onclose=()=>{st.textContent='Disconnected';if(sessionPing){clearInterval(sessionPing);sessionPing=null}};ws.onerror=()=>st.textContent='Error';ws.onmessage=e=>{if(typeof e.data==='string')return;try{drawFrame(new Uint8Array(e.data))}catch(err){st.textContent='Frame decode error';console.error(err)}}}
 function disconnectViewer(){if(sessionPing){clearInterval(sessionPing);sessionPing=null}if(sessionSocket){try{sessionSocket.close()}catch{}sessionSocket=null}document.getElementById('viewer').classList.add('hidden')}
-function drawFrame(b){if(b.length<16||String.fromCharCode(b[0],b[1],b[2],b[3])!=='RPF1')throw Error('bad frame');let v=new DataView(b.buffer,b.byteOffset,b.byteLength),w=v.getUint32(4,true),h=v.getUint32(8,true);if(b[12]!==1||b[13]!==1)throw Error('unsupported frame');let raw=fzstd.decompress(b.subarray(16));if(raw.length!==w*h*4)throw Error('frame size mismatch');if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h}let rgba=new Uint8ClampedArray(raw.length);for(let i=0;i<raw.length;i+=4){rgba[i]=raw[i+2];rgba[i+1]=raw[i+1];rgba[i+2]=raw[i];rgba[i+3]=255}ctx.putImageData(new ImageData(rgba,w,h),0,0)}
+function drawFrame(b){if(b.length<16||String.fromCharCode(b[0],b[1],b[2],b[3])!=='RPF1')throw Error('bad frame');let v=new DataView(b.buffer,b.byteOffset,b.byteLength),w=v.getUint32(4,true),h=v.getUint32(8,true);if(b[12]===2&&b[13]===2){if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h}createImageBitmap(new Blob([b.subarray(16)],{type:'image/jpeg'})).then(bmp=>{ctx.drawImage(bmp,0,0,w,h);bmp.close()}).catch(err=>{console.error(err);throw err});return}if(b[12]!==1||b[13]!==1)throw Error('unsupported frame');throw Error('legacy zstd frames are no longer supported; update the agent')}
 function sendControl(o){if(sessionSocket&&sessionSocket.readyState===WebSocket.OPEN)sessionSocket.send(JSON.stringify(o))}
 function pos(e){let r=canvas.getBoundingClientRect();return{x:Math.max(0,Math.min(1,(e.clientX-r.left)/Math.max(1,r.width))),y:Math.max(0,Math.min(1,(e.clientY-r.top)/Math.max(1,r.height)))}}
-canvas.addEventListener('mousemove',e=>{let n=performance.now();if(n-lastMove<12)return;lastMove=n;let p=pos(e);sendControl({type:'mouse_move',data:{x_norm:p.x,y_norm:p.y}})});
+canvas.addEventListener('mousemove',e=>{let n=performance.now();if(n-lastMove<4)return;lastMove=n;let p=pos(e);sendControl({type:'mouse_move',data:{x_norm:p.x,y_norm:p.y}})});
 canvas.addEventListener('mousedown',e=>{e.preventDefault();canvas.focus();sendControl({type:'mouse_button',data:{button:e.button===2?'right':e.button===1?'middle':'left',down:true}})});
 canvas.addEventListener('mouseup',e=>{e.preventDefault();sendControl({type:'mouse_button',data:{button:e.button===2?'right':e.button===1?'middle':'left',down:false}})});
 canvas.addEventListener('contextmenu',e=>e.preventDefault());

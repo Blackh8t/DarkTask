@@ -26,9 +26,25 @@ pub struct AgentHello {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionPeek {
+    /// A user is logged into the active console session.
+    pub user_logged_in: bool,
+    /// Seconds since last keyboard/mouse input on the console session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_secs: Option<u64>,
+}
+
+impl SessionPeek {
+    /// User considered actively using the PC within this idle window.
+    pub const ACTIVE_IDLE_SECS: u64 = 300;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Heartbeat {
     pub device_id: Uuid,
     pub unix_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_peek: Option<SessionPeek>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +64,8 @@ pub enum ServerToAgent {
         session_id: Uuid,
         controller_id: String,
         session_token: String,
+        #[serde(default)]
+        session_mode: SessionMode,
     },
     Ping,
 }
@@ -61,11 +79,27 @@ pub struct DeviceSummary {
     pub agent_version: String,
     pub online: bool,
     pub last_seen_unix_ms: u64,
+    /// Latest console session activity reported by the agent (online devices only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_peek: Option<SessionPeek>,
+}
+
+/// How the remote session attaches to the endpoint.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMode {
+    /// Shared interactive desktop — assist/support mode.
+    #[default]
+    UserScreen,
+    /// Isolated admin session — not yet implemented on the agent.
+    AdminWorkspace,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRequest {
     pub controller_id: String,
+    #[serde(default)]
+    pub session_mode: SessionMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,9 +132,20 @@ pub enum MouseButton {
 /// [0..4]  magic = b"RPF1"
 /// [4..8]  width u32 LE
 /// [8..12] height u32 LE
-/// [12]    pixel format (1 = BGRA8)
-/// [13]    compression (1 = zstd)
-/// [14..16] reserved
-/// [16..]  compressed BGRA bytes
+/// [12]    pixel format (1 = BGRA8, 2 = JPEG)
+/// [13]    compression (1 = zstd, 2 = jpeg)
+/// [14]    quality hint (jpeg quality 1-100 when format=jpeg)
+/// [15]    reserved
+/// [16..]  payload bytes
 pub const FRAME_MAGIC: &[u8; 4] = b"RPF1";
 pub const FRAME_HEADER_LEN: usize = 16;
+
+pub const FRAME_PIXEL_BGRA8: u8 = 1;
+pub const FRAME_PIXEL_JPEG: u8 = 2;
+pub const FRAME_COMPRESS_ZSTD: u8 = 1;
+pub const FRAME_COMPRESS_JPEG: u8 = 2;
+
+/// Default stream settings tuned for bandwidth over fidelity.
+pub const DEFAULT_JPEG_QUALITY: u8 = 40;
+pub const DEFAULT_STREAM_FPS: u16 = 12;
+pub const MAX_STREAM_FPS: u16 = 15;

@@ -3,7 +3,8 @@ use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use remote_protocol::{
     AgentHello, AgentToServer, ControlMessage, EnrollRequest, EnrollResponse, Heartbeat,
-    MouseButton, ServerToAgent, FRAME_HEADER_LEN, FRAME_MAGIC,
+    MouseButton, ServerToAgent, SessionMode, SessionPeek, DEFAULT_JPEG_QUALITY, DEFAULT_STREAM_FPS,
+    FRAME_COMPRESS_JPEG, FRAME_HEADER_LEN, FRAME_MAGIC, FRAME_PIXEL_JPEG, MAX_STREAM_FPS,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -11,13 +12,17 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tokio::sync::watch;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{info, warn};
 use uuid::Uuid;
+
+#[cfg(windows)]
+use jpeg_encoder::{ColorType, Encoder};
 
 #[cfg(windows)]
 use std::{ffi::{OsStr, OsString}, mem, os::windows::ffi::OsStrExt, ptr};
@@ -39,34 +44,38 @@ use windows_sys::Win32::{
     Foundation::{CloseHandle, HANDLE},
     Graphics::Gdi::*,
     Security::{
-        DuplicateTokenEx, SecurityImpersonation, TokenPrimary, TOKEN_ALL_ACCESS,
+        DuplicateTokenEx, ImpersonateLoggedOnUser, RevertToSelf, SecurityImpersonation,
+        TokenPrimary, TOKEN_ALL_ACCESS,
     },
     System::{
         Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock},
-        RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken},
-        StationsAndDesktops::{
-            CloseDesktop, CreateDesktopW, OpenDesktopW, SetThreadDesktop, SwitchDesktop,
-            DESKTOP_CREATEWINDOW, DESKTOP_READOBJECTS, DESKTOP_SWITCHDESKTOP,
-            DESKTOP_WRITEOBJECTS,
+        RemoteDesktop::{
+            WTSActive, WTSConnectState, WTSGetActiveConsoleSessionId, WTSQuerySessionInformationW,
+            WTSQueryUserToken, WTSUserName, WTS_CURRENT_SERVER_HANDLE,
         },
         Threading::{
-            CreateProcessAsUserW, CreateProcessW, CREATE_UNICODE_ENVIRONMENT,
+            CreateProcessAsUserW, CREATE_UNICODE_ENVIRONMENT,
             PROCESS_INFORMATION, STARTUPINFOW,
         },
+        SystemInformation::GetTickCount,
     },
     UI::{
-        Input::KeyboardAndMouse::*,
+        Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO, *},
         WindowsAndMessaging::*,
     },
 };
 
 const SERVICE_NAME: &str = "DarkTaskAgent";
 const APP_DIR: &str = "DarkTask";
-const DEFAULT_DESKTOP: &str = "DarkTask-2";
 const INSTALL_DIR: &str = r"C:\Program Files\DarkTask";
 const INSTALLED_EXE: &str = r"C:\Program Files\DarkTask\remote-agent.exe";
-const INSTALLED_SHELL: &str = r"C:\Program Files\DarkTask\darktask-shell.exe";
-const DARKTASK_INPUT_MARKER: usize = 0x44544B31; // "DTK1"
+const USER_DESKTOP: &str = r"winsta0\default";
+/// Presence ping interval while idle (no remote session).
+const HEARTBEAT_SECS: u64 = 60;
+const STOP_POLL_SECS: u64 = 5;
+const RECONNECT_SECS: u64 = 5;
+
+static HOSTNAME: OnceLock<String> = OnceLock::new();
 
 #[derive(Parser, Debug)]
 #[command(version, about = "DarkTask managed remote access agent")]
@@ -83,10 +92,8 @@ enum Command {
         server: String,
         #[arg(long)]
         enroll: String,
-        #[arg(long, default_value_t = 20)]
+        #[arg(long, default_value_t = DEFAULT_STREAM_FPS)]
         max_fps: u16,
-        #[arg(long, default_value = DEFAULT_DESKTOP)]
-        desktop: String,
         #[arg(long)]
         reset_identity: bool,
     },
@@ -97,10 +104,8 @@ enum Command {
         server: String,
         #[arg(long)]
         enroll: String,
-        #[arg(long, default_value_t = 20)]
+        #[arg(long, default_value_t = DEFAULT_STREAM_FPS)]
         max_fps: u16,
-        #[arg(long, default_value = DEFAULT_DESKTOP)]
-        desktop: String,
         /// Start the service immediately after installation.
         #[arg(long, default_value_t = true)]
         start: bool,
@@ -127,10 +132,8 @@ enum Command {
         session_id: Uuid,
         #[arg(long)]
         session_token: String,
-        #[arg(long, default_value_t = 20)]
+        #[arg(long, default_value_t = DEFAULT_STREAM_FPS)]
         max_fps: u16,
-        #[arg(long, default_value = DEFAULT_DESKTOP)]
-        desktop: String,
     },
 }
 
@@ -140,8 +143,6 @@ struct AgentConfig {
     enroll: String,
     #[serde(default = "default_fps")]
     max_fps: u16,
-    #[serde(default = "default_desktop")]
-    desktop: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,8 +151,7 @@ struct Identity {
     device_token: String,
 }
 
-fn default_fps() -> u16 { 20 }
-fn default_desktop() -> String { DEFAULT_DESKTOP.to_string() }
+fn default_fps() -> u16 { DEFAULT_STREAM_FPS }
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -175,8 +175,10 @@ fn identity_path() -> PathBuf {
     program_data_dir().join("identity.json")
 }
 
-fn hostname() -> String {
-    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown-host".into())
+fn hostname() -> &'static str {
+    HOSTNAME.get_or_init(|| {
+        std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown-host".into())
+    })
 }
 
 fn ws_url(server: &str, path: &str) -> String {
@@ -209,7 +211,7 @@ fn load_or_enroll(config: &AgentConfig, reset_identity: bool) -> Result<Identity
         let client = reqwest::Client::new();
         let req = EnrollRequest {
             enrollment_token: config.enroll.clone(),
-            hostname: hostname(),
+            hostname: hostname().into(),
             platform: std::env::consts::OS.into(),
             arch: std::env::consts::ARCH.into(),
             agent_version: env!("CARGO_PKG_VERSION").into(),
@@ -249,19 +251,6 @@ fn install_service(config: AgentConfig, start_now: bool) -> Result<()> {
         fs::copy(&current_exe, &installed_exe)
             .with_context(|| format!("copy {} -> {}", current_exe.display(), installed_exe.display()))?;
     }
-
-    let source_shell = current_exe
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join("darktask-shell.exe");
-    let installed_shell = PathBuf::from(INSTALLED_SHELL);
-    if !source_shell.exists() {
-        return Err(anyhow!(
-            "darktask-shell.exe is missing next to remote-agent.exe; build the remote-agent package first"
-        ));
-    }
-    fs::copy(&source_shell, &installed_shell)
-        .with_context(|| format!("copy {} -> {}", source_shell.display(), installed_shell.display()))?;
 
     fs::write(config_path(), serde_json::to_vec_pretty(&config)?)?;
 
@@ -359,7 +348,6 @@ fn show_status() -> Result<()> {
     println!("DarkTask");
     println!("-------");
     println!("Installed binary : {}", INSTALLED_EXE);
-    println!("Shell binary     : {}", INSTALLED_SHELL);
     println!("Config path      : {}", config_path().display());
     println!("Identity path    : {}", identity_path().display());
     println!("Config exists    : {}", config_path().exists());
@@ -367,7 +355,6 @@ fn show_status() -> Result<()> {
 
     if let Ok(config) = read_config() {
         println!("Server           : {}", config.server);
-        println!("Desktop          : {}", config.desktop);
         println!("Max FPS          : {}", config.max_fps);
         println!("Enroll token     : configured");
     }
@@ -400,27 +387,38 @@ fn main() -> Result<()> {
 define_windows_service!(ffi_service_main, service_main);
 
 #[cfg(windows)]
-fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter("remote_agent=info")
-        .init();
+fn init_tracing(command: &Option<Command>) {
+    match command {
+        None | Some(Command::Service) | Some(Command::Worker { .. }) => {}
+        _ => {
+            tracing_subscriber::fmt()
+                .with_env_filter("remote_agent=info")
+                .init();
+        }
+    }
+}
 
+#[cfg(windows)]
+fn main() -> Result<()> {
     let cli = Cli::parse();
+    init_tracing(&cli.command);
 
     match cli.command.unwrap_or(Command::Service) {
-        Command::Install { server, enroll, max_fps, desktop, start } => {
-            install_service(AgentConfig { server, enroll, max_fps, desktop }, start)
+        Command::Install { server, enroll, max_fps, start } => {
+            install_service(AgentConfig { server, enroll, max_fps }, start)
         }
 
         Command::Uninstall { purge } => uninstall_service(purge),
 
         Command::Status => show_status(),
 
-        Command::Run { server, enroll, max_fps, desktop, reset_identity } => {
-            let config = AgentConfig { server, enroll, max_fps, desktop };
+        Command::Run { server, enroll, max_fps, reset_identity } => {
+            let config = AgentConfig { server, enroll, max_fps };
             let identity = load_or_enroll(&config, reset_identity)?;
             let stop = Arc::new(AtomicBool::new(false));
-            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
             rt.block_on(run_control_plane(config, identity, stop))
         }
 
@@ -429,8 +427,8 @@ fn main() -> Result<()> {
             Ok(())
         }
 
-        Command::Worker { server, session_id, session_token, max_fps, desktop } => {
-            run_worker(server, session_id, session_token, max_fps, desktop)
+        Command::Worker { server, session_id, session_token, max_fps } => {
+            run_worker(server, session_id, session_token, max_fps)
         }
     }
 }
@@ -484,8 +482,7 @@ fn run_windows_service() -> Result<()> {
         process_id: None,
     })?;
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
 
@@ -508,6 +505,110 @@ fn run_windows_service() -> Result<()> {
     result
 }
 
+#[cfg(windows)]
+fn console_user_logged_in(session_id: u32) -> bool {
+    unsafe {
+        use std::ffi::c_void;
+        use windows_sys::Win32::System::RemoteDesktop::WTSFreeMemory;
+
+        let mut buffer: *mut c_void = ptr::null_mut();
+        let mut bytes_returned = 0u32;
+        if WTSQuerySessionInformationW(
+            WTS_CURRENT_SERVER_HANDLE,
+            session_id,
+            WTSUserName,
+            &mut buffer as *mut _ as *mut _,
+            &mut bytes_returned,
+        ) == 0
+            || buffer.is_null()
+        {
+            return false;
+        }
+
+        let logged_in = *(buffer as *const u16) != 0;
+        WTSFreeMemory(buffer);
+        if !logged_in {
+            return false;
+        }
+
+        buffer = ptr::null_mut();
+        bytes_returned = 0;
+        if WTSQuerySessionInformationW(
+            WTS_CURRENT_SERVER_HANDLE,
+            session_id,
+            WTSConnectState,
+            &mut buffer as *mut _ as *mut _,
+            &mut bytes_returned,
+        ) == 0
+            || buffer.is_null()
+        {
+            return logged_in;
+        }
+
+        let active = *(buffer as *const u32) == WTSActive as u32;
+        WTSFreeMemory(buffer);
+        active
+    }
+}
+
+#[cfg(windows)]
+fn query_console_idle_secs(session_id: u32) -> Option<u64> {
+    unsafe {
+        let mut user_token: HANDLE = ptr::null_mut();
+        if WTSQueryUserToken(session_id, &mut user_token) == 0 {
+            return None;
+        }
+
+        if ImpersonateLoggedOnUser(user_token) == 0 {
+            CloseHandle(user_token);
+            return None;
+        }
+
+        let mut info: LASTINPUTINFO = mem::zeroed();
+        info.cbSize = mem::size_of::<LASTINPUTINFO>() as u32;
+        let ok = GetLastInputInfo(&mut info);
+        RevertToSelf();
+        CloseHandle(user_token);
+
+        if ok == 0 {
+            return None;
+        }
+
+        let elapsed_ms = GetTickCount().wrapping_sub(info.dwTime);
+        Some((elapsed_ms / 1000) as u64)
+    }
+}
+
+#[cfg(windows)]
+fn collect_session_peek() -> Option<SessionPeek> {
+    unsafe {
+        let session_id = WTSGetActiveConsoleSessionId();
+        if session_id == u32::MAX {
+            return Some(SessionPeek {
+                user_logged_in: false,
+                idle_secs: None,
+            });
+        }
+
+        let user_logged_in = console_user_logged_in(session_id);
+        let idle_secs = if user_logged_in {
+            query_console_idle_secs(session_id)
+        } else {
+            None
+        };
+
+        Some(SessionPeek {
+            user_logged_in,
+            idle_secs,
+        })
+    }
+}
+
+#[cfg(not(windows))]
+fn collect_session_peek() -> Option<SessionPeek> {
+    None
+}
+
 async fn run_control_plane(
     config: AgentConfig,
     identity: Identity,
@@ -519,7 +620,7 @@ async fn run_control_plane(
         }
 
         if !stop.load(Ordering::SeqCst) {
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            tokio::time::sleep(Duration::from_secs(RECONNECT_SECS)).await;
         }
     }
     Ok(())
@@ -537,13 +638,17 @@ async fn run_connection(
     let hello = AgentToServer::Hello(AgentHello {
         device_id: identity.device_id,
         device_token: identity.device_token.clone(),
-        hostname: hostname(),
+        hostname: hostname().into(),
         agent_version: env!("CARGO_PKG_VERSION").into(),
     });
 
     tx.send(Message::Text(serde_json::to_string(&hello)?.into())).await?;
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
-    let mut stop_check = tokio::time::interval(Duration::from_secs(1));
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut stop_check = tokio::time::interval(Duration::from_secs(STOP_POLL_SECS));
+    stop_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // First tick fires immediately; skip so hello isn't followed by instant peek work.
+    heartbeat.tick().await;
 
     loop {
         tokio::select! {
@@ -558,6 +663,7 @@ async fn run_connection(
                 let hb = AgentToServer::Heartbeat(Heartbeat {
                     device_id: identity.device_id,
                     unix_ms: now_ms(),
+                    session_peek: collect_session_peek(),
                 });
                 tx.send(Message::Text(serde_json::to_string(&hb)?.into())).await?;
             }
@@ -577,15 +683,24 @@ async fn run_connection(
                         session_id,
                         controller_id,
                         session_token,
+                        session_mode,
                     } => {
-                        info!(%session_id, %controller_id, "remote session requested");
+                        info!(%session_id, %controller_id, ?session_mode, "remote session requested");
+
+                        if session_mode == SessionMode::AdminWorkspace {
+                            let reply = AgentToServer::SessionRejected {
+                                session_id,
+                                reason: "admin workspace is not yet supported; connect with user_screen".into(),
+                            };
+                            tx.send(Message::Text(serde_json::to_string(&reply)?.into())).await?;
+                            continue;
+                        }
 
                         match spawn_interactive_worker(
                             &config.server,
                             session_id,
                             &session_token,
                             config.max_fps,
-                            &config.desktop,
                         ) {
                             Ok(()) => {
                                 let reply = AgentToServer::SessionAccepted { session_id };
@@ -627,7 +742,6 @@ fn spawn_interactive_worker(
     session_id: Uuid,
     session_token: &str,
     max_fps: u16,
-    desktop: &str,
 ) -> Result<()> {
     unsafe {
         let session_id_os = WTSGetActiveConsoleSessionId();
@@ -655,17 +769,16 @@ fn spawn_interactive_worker(
 
         let exe = std::env::current_exe()?;
         let command = format!(
-            "{} worker --server {} --session-id {} --session-token {} --max-fps {} --desktop {}",
+            "{} worker --server {} --session-id {} --session-token {} --max-fps {}",
             quote_arg(&exe.to_string_lossy()),
             quote_arg(server),
             session_id,
             quote_arg(session_token),
             max_fps,
-            quote_arg(desktop),
         );
 
         let mut command_w = wide(&command);
-        let desktop_w = wide(r"winsta0\default");
+        let desktop_w = wide(USER_DESKTOP);
 
         let mut startup: STARTUPINFOW = mem::zeroed();
         startup.cb = mem::size_of::<STARTUPINFOW>() as u32;
@@ -714,108 +827,8 @@ fn spawn_interactive_worker(
     _session_id: Uuid,
     _session_token: &str,
     _max_fps: u16,
-    _desktop: &str,
 ) -> Result<()> {
     Err(anyhow!("interactive worker is Windows-only"))
-}
-
-#[cfg(windows)]
-struct DesktopGuard {
-    default_desktop: isize,
-    remote_desktop: isize,
-}
-
-#[cfg(windows)]
-impl Drop for DesktopGuard {
-    fn drop(&mut self) {
-        unsafe {
-            if self.default_desktop != 0 {
-                let _ = SwitchDesktop(self.default_desktop as _);
-                CloseDesktop(self.default_desktop as _);
-            }
-            if self.remote_desktop != 0 {
-                CloseDesktop(self.remote_desktop as _);
-            }
-        }
-    }
-}
-
-#[cfg(windows)]
-fn create_and_switch_desktop(name: &str) -> Result<DesktopGuard> {
-    unsafe {
-        let default_name = wide("Default");
-        let default_desktop = OpenDesktopW(
-            default_name.as_ptr(),
-            0,
-            0,
-            DESKTOP_SWITCHDESKTOP | DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS,
-        );
-        if default_desktop.is_null() {
-            return Err(anyhow!("OpenDesktopW(Default) failed"));
-        }
-
-        let remote_name = wide(name);
-        let remote_desktop = CreateDesktopW(
-            remote_name.as_ptr(),
-            ptr::null(),
-            ptr::null_mut(),
-            0,
-            DESKTOP_CREATEWINDOW
-                | DESKTOP_SWITCHDESKTOP
-                | DESKTOP_READOBJECTS
-                | DESKTOP_WRITEOBJECTS,
-            ptr::null(),
-        );
-
-        if remote_desktop.is_null() {
-            CloseDesktop(default_desktop);
-            return Err(anyhow!("CreateDesktopW({name}) failed"));
-        }
-
-        if SetThreadDesktop(remote_desktop) == 0 {
-            CloseDesktop(remote_desktop);
-            CloseDesktop(default_desktop);
-            return Err(anyhow!("SetThreadDesktop({name}) failed"));
-        }
-
-        if SwitchDesktop(remote_desktop) == 0 {
-            CloseDesktop(remote_desktop);
-            CloseDesktop(default_desktop);
-            return Err(anyhow!("SwitchDesktop({name}) failed"));
-        }
-
-        Ok(DesktopGuard {
-            default_desktop: default_desktop as isize,
-            remote_desktop: remote_desktop as isize,
-        })
-    }
-}
-
-#[cfg(windows)]
-fn launch_workspace_process(desktop: &str) -> Result<()> {
-    unsafe {
-        let desktop_spec = format!(r"winsta0\{desktop}");
-        let desktop_w = wide(&desktop_spec);
-        let shell_path = PathBuf::from(INSTALLED_SHELL);
-        if !shell_path.exists() {
-            return Err(anyhow!("{} is missing", shell_path.display()));
-        }
-        let mut command = wide(&quote_arg(&shell_path.to_string_lossy()));
-        let mut startup: STARTUPINFOW = mem::zeroed();
-        startup.cb = mem::size_of::<STARTUPINFOW>() as u32;
-        startup.lpDesktop = desktop_w.as_ptr() as *mut u16;
-        let mut process: PROCESS_INFORMATION = mem::zeroed();
-
-        if CreateProcessW(
-            ptr::null(), command.as_mut_ptr(), ptr::null(), ptr::null(), 0, 0,
-            ptr::null(), ptr::null(), &startup, &mut process
-        ) == 0 {
-            return Err(anyhow!("CreateProcessW DarkTask shell failed"));
-        }
-        CloseHandle(process.hThread);
-        CloseHandle(process.hProcess);
-        Ok(())
-    }
 }
 
 #[cfg(windows)]
@@ -824,28 +837,12 @@ fn run_worker(
     session_id: Uuid,
     session_token: String,
     max_fps: u16,
-    desktop: String,
 ) -> Result<()> {
-    // A dedicated OS thread is used because SetThreadDesktop is thread-specific.
-    let worker = std::thread::spawn(move || -> Result<()> {
-        let _guard = create_and_switch_desktop(&desktop)?;
-        launch_workspace_process(&desktop)?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-
-        rt.block_on(run_remote_session(
-            server,
-            session_id,
-            session_token,
-            max_fps,
-        ))
-    });
-
-    worker
-        .join()
-        .map_err(|_| anyhow!("desktop worker thread panicked"))?
+    rt.block_on(run_remote_session(server, session_id, session_token, max_fps))
 }
 
 #[cfg(not(windows))]
@@ -854,9 +851,148 @@ fn run_worker(
     _session_id: Uuid,
     _session_token: String,
     _max_fps: u16,
-    _desktop: String,
 ) -> Result<()> {
     Err(anyhow!("worker is Windows-only"))
+}
+
+#[cfg(windows)]
+struct FrameCapture {
+    width: i32,
+    height: i32,
+    screen: HDC,
+    mem_dc: HDC,
+    bitmap: HGDIOBJ,
+    pixels: Vec<u8>,
+    jpeg_buf: Vec<u8>,
+    quality: u8,
+    info: BITMAPINFO,
+}
+
+#[cfg(windows)]
+impl FrameCapture {
+    fn new(width: i32, height: i32) -> Result<Self> {
+        unsafe {
+            let screen = GetDC(ptr::null_mut());
+            if screen.is_null() {
+                return Err(anyhow!("GetDC failed"));
+            }
+
+            let mem_dc = CreateCompatibleDC(screen);
+            if mem_dc.is_null() {
+                ReleaseDC(ptr::null_mut(), screen);
+                return Err(anyhow!("CreateCompatibleDC failed"));
+            }
+
+            let bitmap = CreateCompatibleBitmap(screen, width, height);
+            if bitmap.is_null() {
+                DeleteDC(mem_dc);
+                ReleaseDC(ptr::null_mut(), screen);
+                return Err(anyhow!("CreateCompatibleBitmap failed"));
+            }
+
+            SelectObject(mem_dc, bitmap as _);
+
+            let mut info: BITMAPINFO = mem::zeroed();
+            info.bmiHeader.biSize = mem::size_of::<BITMAPINFOHEADER>() as u32;
+            info.bmiHeader.biWidth = width;
+            info.bmiHeader.biHeight = -height;
+            info.bmiHeader.biPlanes = 1;
+            info.bmiHeader.biBitCount = 32;
+            info.bmiHeader.biCompression = BI_RGB;
+
+            Ok(Self {
+                width,
+                height,
+                screen,
+                mem_dc,
+                bitmap,
+                pixels: vec![0u8; width as usize * height as usize * 4],
+                jpeg_buf: Vec::with_capacity(64 * 1024),
+                quality: DEFAULT_JPEG_QUALITY,
+                info,
+            })
+        }
+    }
+
+    fn capture(&mut self) -> Result<Vec<u8>> {
+        unsafe {
+            let width = GetSystemMetrics(SM_CXSCREEN);
+            let height = GetSystemMetrics(SM_CYSCREEN);
+            if width <= 0 || height <= 0 {
+                return Err(anyhow!("invalid desktop dimensions"));
+            }
+            if width != self.width || height != self.height {
+                *self = Self::new(width, height)?;
+            }
+
+            if BitBlt(
+                self.mem_dc,
+                0,
+                0,
+                self.width,
+                self.height,
+                self.screen,
+                0,
+                0,
+                SRCCOPY,
+            ) == 0
+            {
+                return Err(anyhow!("BitBlt failed"));
+            }
+
+            let rows = GetDIBits(
+                self.mem_dc,
+                self.bitmap as _,
+                0,
+                self.height as u32,
+                self.pixels.as_mut_ptr() as *mut _,
+                &mut self.info,
+                DIB_RGB_COLORS,
+            );
+            if rows == 0 {
+                return Err(anyhow!("GetDIBits failed"));
+            }
+
+            self.jpeg_buf.clear();
+            let encoder = Encoder::new(
+                &mut self.jpeg_buf,
+                self.width as u16,
+                self.height as u16,
+                ColorType::Bgra,
+            );
+            encoder
+                .encode(&self.pixels, self.quality)
+                .map_err(|e| anyhow!("jpeg encode failed: {e}"))?;
+
+            let mut out = Vec::with_capacity(FRAME_HEADER_LEN + self.jpeg_buf.len());
+            out.extend_from_slice(FRAME_MAGIC);
+            out.extend_from_slice(&(self.width as u32).to_le_bytes());
+            out.extend_from_slice(&(self.height as u32).to_le_bytes());
+            out.push(FRAME_PIXEL_JPEG);
+            out.push(FRAME_COMPRESS_JPEG);
+            out.push(self.quality);
+            out.push(0);
+            out.extend_from_slice(&self.jpeg_buf);
+            Ok(out)
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for FrameCapture {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.bitmap.is_null() {
+                DeleteObject(self.bitmap as _);
+            }
+            if !self.mem_dc.is_null() {
+                DeleteDC(self.mem_dc);
+            }
+            if !self.screen.is_null() {
+                ReleaseDC(ptr::null_mut(), self.screen);
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -878,20 +1014,36 @@ async fn run_remote_session(
         .context("connect session websocket")?;
 
     let (mut tx, mut rx) = ws.split();
+    let (frame_tx, frame_rx) = watch::channel(Vec::new());
 
-    let fps = max_fps.clamp(1, 30);
+    let fps = max_fps.clamp(8, MAX_STREAM_FPS);
     let mut ticker =
         tokio::time::interval(Duration::from_millis(1000 / fps as u64));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+    let height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+    let mut capture = FrameCapture::new(width, height)?;
+
+    let send_task = tokio::spawn(async move {
+        let mut frame_rx = frame_rx;
+        loop {
+            if frame_rx.changed().await.is_err() {
+                break;
+            }
+            let frame = frame_rx.borrow().clone();
+            if frame.is_empty() {
+                continue;
+            }
+            if tx.send(Message::Binary(frame.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+
     loop {
         tokio::select! {
-            _ = ticker.tick() => {
-                // Deliberately run capture on this same OS thread: the thread is attached
-                // to DarkTask-2 via SetThreadDesktop.
-                let frame = capture_frame()?;
-                tx.send(Message::Binary(frame.into())).await?;
-            }
+            biased;
 
             msg = rx.next() => {
                 let Some(msg) = msg else { break };
@@ -905,104 +1057,20 @@ async fn run_remote_session(
                     _ => {}
                 }
             }
+
+            _ = ticker.tick() => {
+                match capture.capture() {
+                    Ok(frame) => {
+                        let _ = frame_tx.send(frame);
+                    }
+                    Err(e) => warn!(error=%e, "frame capture failed"),
+                }
+            }
         }
     }
 
+    send_task.abort();
     Ok(())
-}
-
-#[cfg(windows)]
-fn capture_frame() -> Result<Vec<u8>> {
-    unsafe {
-        let width = GetSystemMetrics(SM_CXSCREEN);
-        let height = GetSystemMetrics(SM_CYSCREEN);
-
-        if width <= 0 || height <= 0 {
-            return Err(anyhow!("invalid desktop dimensions"));
-        }
-
-        let hwnd = ptr::null_mut();
-        let screen = GetDC(hwnd);
-        if screen.is_null() {
-            return Err(anyhow!("GetDC failed"));
-        }
-
-        let mem_dc = CreateCompatibleDC(screen);
-        if mem_dc.is_null() {
-            ReleaseDC(hwnd, screen);
-            return Err(anyhow!("CreateCompatibleDC failed"));
-        }
-
-        let bitmap = CreateCompatibleBitmap(screen, width, height);
-        if bitmap.is_null() {
-            DeleteDC(mem_dc);
-            ReleaseDC(hwnd, screen);
-            return Err(anyhow!("CreateCompatibleBitmap failed"));
-        }
-
-        let old = SelectObject(mem_dc, bitmap as _);
-
-        if BitBlt(
-            mem_dc,
-            0,
-            0,
-            width,
-            height,
-            screen,
-            0,
-            0,
-            SRCCOPY | CAPTUREBLT,
-        ) == 0
-        {
-            SelectObject(mem_dc, old);
-            DeleteObject(bitmap as _);
-            DeleteDC(mem_dc);
-            ReleaseDC(hwnd, screen);
-            return Err(anyhow!("BitBlt failed"));
-        }
-
-        let mut info: BITMAPINFO = mem::zeroed();
-        info.bmiHeader.biSize = mem::size_of::<BITMAPINFOHEADER>() as u32;
-        info.bmiHeader.biWidth = width;
-        info.bmiHeader.biHeight = -height;
-        info.bmiHeader.biPlanes = 1;
-        info.bmiHeader.biBitCount = 32;
-        info.bmiHeader.biCompression = BI_RGB;
-
-        let mut pixels = vec![0u8; width as usize * height as usize * 4];
-
-        let rows = GetDIBits(
-            mem_dc,
-            bitmap,
-            0,
-            height as u32,
-            pixels.as_mut_ptr() as *mut _,
-            &mut info,
-            DIB_RGB_COLORS,
-        );
-
-        SelectObject(mem_dc, old);
-        DeleteObject(bitmap as _);
-        DeleteDC(mem_dc);
-        ReleaseDC(hwnd, screen);
-
-        if rows == 0 {
-            return Err(anyhow!("GetDIBits failed"));
-        }
-
-        let compressed = zstd::stream::encode_all(&pixels[..], 1)?;
-        let mut out = Vec::with_capacity(FRAME_HEADER_LEN + compressed.len());
-
-        out.extend_from_slice(FRAME_MAGIC);
-        out.extend_from_slice(&(width as u32).to_le_bytes());
-        out.extend_from_slice(&(height as u32).to_le_bytes());
-        out.push(1); // BGRA8
-        out.push(1); // zstd
-        out.extend_from_slice(&[0, 0]);
-        out.extend_from_slice(&compressed);
-
-        Ok(out)
-    }
 }
 
 #[cfg(windows)]
@@ -1032,22 +1100,16 @@ fn apply_control(msg: ControlMessage) -> Result<()> {
                     (MouseButton::Middle, true) => MOUSEEVENTF_MIDDLEDOWN,
                     (MouseButton::Middle, false) => MOUSEEVENTF_MIDDLEUP,
                 };
-                mouse_event(flag, 0, 0, 0, DARKTASK_INPUT_MARKER);
+                mouse_event(flag, 0, 0, 0, 0);
             }
 
             ControlMessage::MouseWheel { delta } => {
-                mouse_event(
-                    MOUSEEVENTF_WHEEL,
-                    0,
-                    0,
-                    delta,
-                    DARKTASK_INPUT_MARKER,
-                );
+                mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, 0);
             }
 
             ControlMessage::Key { vk, down } => {
                 let flags = if down { 0 } else { KEYEVENTF_KEYUP };
-                keybd_event(vk as u8, 0, flags, DARKTASK_INPUT_MARKER);
+                keybd_event(vk as u8, 0, flags, 0);
             }
 
             ControlMessage::SetQuality { .. } | ControlMessage::Ping { .. } => {}

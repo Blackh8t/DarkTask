@@ -14,7 +14,7 @@ version = "0.3.0"
 
 [workspace.dependencies]
 anyhow = "1"
-axum = { version = "0.8", features = ["ws", "macros"] }
+axum = { version = "0.8", features = ["ws", "macros", "multipart"] }
 clap = { version = "4", features = ["derive"] }
 dashmap = "6"
 futures-util = "0.3"
@@ -34,6 +34,8 @@ hex = "0.4"
 
 bytes = "1"
 zstd = "0.13"
+jpeg-encoder = "0.6"
+jpeg-decoder = "0.3"
 minifb = "0.28"
 windows-sys = { version = "0.60", features = [
   "Win32_Foundation",

@@ -3,9 +3,11 @@ use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use minifb::{Key, KeyRepeat, MouseButton as MfMouseButton, MouseMode, Window, WindowOptions};
 use remote_protocol::{
-    ControlMessage, DeviceSummary, MouseButton, SessionRequest, SessionResponse, FRAME_HEADER_LEN,
-    FRAME_MAGIC,
+    ControlMessage, DeviceSummary, MouseButton, SessionMode, SessionRequest, SessionResponse,
+    FRAME_COMPRESS_JPEG, FRAME_COMPRESS_ZSTD, FRAME_HEADER_LEN, FRAME_MAGIC, FRAME_PIXEL_BGRA8,
+    FRAME_PIXEL_JPEG,
 };
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -29,7 +31,20 @@ enum Command {
         device_id: Uuid,
         #[arg(long, default_value = "local-tech")]
         controller_id: String,
+        /// `user_screen` (default) or `admin_workspace` (not yet supported on agent).
+        #[arg(long, default_value = "user_screen")]
+        session_mode: String,
     },
+}
+
+fn parse_session_mode(raw: &str) -> Result<SessionMode> {
+    match raw {
+        "user_screen" => Ok(SessionMode::UserScreen),
+        "admin_workspace" => Ok(SessionMode::AdminWorkspace),
+        _ => Err(anyhow!(
+            "invalid session mode {raw:?}; expected user_screen or admin_workspace"
+        )),
+    }
 }
 
 fn now_ms() -> u64 {
@@ -72,10 +87,18 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        Command::Connect { device_id, controller_id } => {
+        Command::Connect {
+            device_id,
+            controller_id,
+            session_mode,
+        } => {
+            let session_mode = parse_session_mode(&session_mode)?;
             let resp = client
                 .post(format!("{base}/api/v1/devices/{device_id}/session"))
-                .json(&SessionRequest { controller_id })
+                .json(&SessionRequest {
+                    controller_id,
+                    session_mode,
+                })
                 .header("Authorization", &auth)
                 .send()
                 .await?
@@ -100,13 +123,18 @@ async fn run_viewer(server: String, session: SessionResponse) -> Result<()> {
     let (ws, _) = connect_async(&url).await.context("connect session websocket")?;
     let (mut sink, mut stream) = ws.split();
 
-    let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (frame_tx, mut frame_rx) = mpsc::channel(1);
+    let latest_frame = Arc::new(Mutex::new(None::<Vec<u8>>));
+    let latest_for_rx = latest_frame.clone();
     let (control_tx, mut control_rx) = mpsc::unbounded_channel::<ControlMessage>();
 
     let receive_task = tokio::spawn(async move {
         while let Some(msg) = stream.next().await {
             match msg {
-                Ok(Message::Binary(data)) => { let _ = frame_tx.send(data.to_vec()); }
+                Ok(Message::Binary(data)) => {
+                    *latest_for_rx.lock().unwrap() = Some(data.to_vec());
+                    let _ = frame_tx.try_send(());
+                }
                 Ok(Message::Close(_)) | Err(_) => break,
                 _ => {}
             }
@@ -124,7 +152,14 @@ async fn run_viewer(server: String, session: SessionResponse) -> Result<()> {
     });
 
     let viewer = tokio::task::spawn_blocking(move || -> Result<()> {
-        let first = frame_rx.blocking_recv().ok_or_else(|| anyhow!("session closed before first frame"))?;
+        frame_rx
+            .blocking_recv()
+            .ok_or_else(|| anyhow!("session closed before first frame"))?;
+        let first = latest_frame
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| anyhow!("session closed before first frame"))?;
         let (mut width, mut height, mut pixels) = decode_frame(&first)?;
         let mut window = Window::new(
             "Remote Platform v0.3",
@@ -142,9 +177,13 @@ async fn run_viewer(server: String, session: SessionResponse) -> Result<()> {
         let mut ping_at = std::time::Instant::now();
 
         while window.is_open() && !window.is_key_down(Key::Escape) {
-            while let Ok(frame) = frame_rx.try_recv() {
-                if let Ok((w, h, p)) = decode_frame(&frame) {
-                    width = w; height = h; pixels = p;
+            while frame_rx.try_recv().is_ok() {
+                if let Some(frame) = latest_frame.lock().unwrap().take() {
+                    if let Ok((w, h, p)) = decode_frame(&frame) {
+                        width = w;
+                        height = h;
+                        pixels = p;
+                    }
                 }
             }
 
@@ -154,7 +193,7 @@ async fn run_viewer(server: String, session: SessionResponse) -> Result<()> {
                 let (ww, wh) = window.get_size();
                 let x = (mx / ww.max(1) as f32).clamp(0.0, 1.0);
                 let y = (my / wh.max(1) as f32).clamp(0.0, 1.0);
-                if (x - last_mouse.0).abs() > 0.0005 || (y - last_mouse.1).abs() > 0.0005 {
+                if (x - last_mouse.0).abs() > 0.0002 || (y - last_mouse.1).abs() > 0.0002 {
                     let _ = control_tx.send(ControlMessage::MouseMove { x_norm: x, y_norm: y });
                     last_mouse = (x, y);
                 }
@@ -212,9 +251,36 @@ fn decode_frame(frame: &[u8]) -> Result<(usize, usize, Vec<u32>)> {
     }
     let width = u32::from_le_bytes(frame[4..8].try_into().unwrap()) as usize;
     let height = u32::from_le_bytes(frame[8..12].try_into().unwrap()) as usize;
-    if frame[12] != 1 || frame[13] != 1 { return Err(anyhow!("unsupported frame format")); }
-    let bgra = zstd::stream::decode_all(&frame[FRAME_HEADER_LEN..])?;
-    if bgra.len() != width * height * 4 { return Err(anyhow!("frame size mismatch")); }
+    let payload = &frame[FRAME_HEADER_LEN..];
+
+    if frame[12] == FRAME_PIXEL_JPEG && frame[13] == FRAME_COMPRESS_JPEG {
+        let mut decoder = jpeg_decoder::Decoder::new(payload);
+        let rgb = decoder
+            .decode()
+            .map_err(|e| anyhow!("jpeg decode failed: {e}"))?;
+        let info = decoder
+            .info()
+            .ok_or_else(|| anyhow!("jpeg missing image info"))?;
+        if info.width as usize != width || info.height as usize != height {
+            return Err(anyhow!("jpeg dimensions mismatch"));
+        }
+        let mut pixels = Vec::with_capacity(width * height);
+        for px in rgb.chunks_exact(3) {
+            let r = px[0] as u32;
+            let g = px[1] as u32;
+            let b = px[2] as u32;
+            pixels.push((r << 16) | (g << 8) | b);
+        }
+        return Ok((width, height, pixels));
+    }
+
+    if frame[12] != FRAME_PIXEL_BGRA8 || frame[13] != FRAME_COMPRESS_ZSTD {
+        return Err(anyhow!("unsupported frame format"));
+    }
+    let bgra = zstd::stream::decode_all(payload)?;
+    if bgra.len() != width * height * 4 {
+        return Err(anyhow!("frame size mismatch"));
+    }
     let mut pixels = Vec::with_capacity(width * height);
     for px in bgra.chunks_exact(4) {
         let b = px[0] as u32;

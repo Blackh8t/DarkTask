@@ -16,4 +16,5 @@ tokio.workspace = true
 tokio-tungstenite.workspace = true
 url.workspace = true
 uuid.workspace = true
+jpeg-decoder.workspace = true
 zstd.workspace = true
