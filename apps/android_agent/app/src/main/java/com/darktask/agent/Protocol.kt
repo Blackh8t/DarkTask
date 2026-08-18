@@ -115,19 +115,19 @@ object Protocol {
         }
     }
 
-    fun rpf1(width: Int, height: Int, quality: Int, jpeg: ByteArray): ByteArray {
-        val out = ByteArray(16 + jpeg.size)
+    fun rpf1H264(width: Int, height: Int, keyframe: Boolean, payload: ByteArray): ByteArray {
+        val out = ByteArray(16 + payload.size)
         out[0] = 'R'.code.toByte()
         out[1] = 'P'.code.toByte()
         out[2] = 'F'.code.toByte()
         out[3] = '1'.code.toByte()
         writeU32Le(out, 4, width)
         writeU32Le(out, 8, height)
-        out[12] = 2 // FRAME_PIXEL_JPEG
-        out[13] = 2 // FRAME_COMPRESS_JPEG
-        out[14] = quality.toByte()
+        out[12] = 3
+        out[13] = 3
+        out[14] = if (keyframe) 1 else 0
         out[15] = 0
-        System.arraycopy(jpeg, 0, out, 16, jpeg.size)
+        System.arraycopy(payload, 0, out, 16, payload.size)
         return out
     }
 

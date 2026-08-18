@@ -7,7 +7,7 @@
 | WebRTC remote viewer | Target | Target | Target | Target screen broadcast |
 | Touch -> remote mouse | Target | Target | N/A | N/A |
 | Remote keyboard to Windows | Target | Target | N/A | N/A |
-| Full device screen sharing | N/A | N/A | Yes — user-approved MediaProjection, no audio, JPEG 40 @ 12fps / 1280px | User-approved ReplayKit |
+| Full device screen sharing | N/A | N/A | Yes — MediaProjection, no audio, H.264 1 Mbps @ 12fps / 1280px | User-approved ReplayKit |
 | Arbitrary system remote control | N/A | N/A | Constrained; AccessibilityService gestures (tap/swipe/Back/Home) | No general public API |
 | Certificate technician identity | Target | Target | Device identity | Device identity |
 

@@ -1,19 +1,19 @@
 # DarkTask Android endpoint
 
-Enrolled Android device agent. Speaks the same control-plane and RPF1 JPEG session protocol as the Windows agent so the existing admin portal and `remote-controller` can connect without a new decoder.
+Enrolled Android device agent. Speaks the same control-plane protocol as the Windows agent. Android video is hardware H.264 (no audio); Windows remains JPEG. The admin portal and `remote-controller` decode both.
 
 Encoder profile (no audio, bandwidth over fidelity), taken from [scrcpy-remote-android](https://github.com/nustato/scrcpy-remote-android) + DarkTask defaults:
 
 | Setting | Value |
 |---|---|
 | Audio | off |
-| Max size | 1280 (longest edge, multiple of 8) |
-| JPEG quality | 40 |
+| Max size | 1280 (longest edge, multiple of 16) |
+| Video | H.264 Baseline, 1 Mbps |
 | FPS | 12 (cap 15) |
 
 `scrcpy-server` itself cannot run inside a normal APK (it requires the ADB/shell UID for SurfaceControl + INJECT_EVENTS). This app uses the platform-legal equivalents:
 
-- **Capture:** user-approved MediaProjection (no microphone)
+- **Capture:** user-approved MediaProjection (no microphone), hardware H.264 @ 1 Mbps
 - **Input:** user-approved AccessibilityService gestures (Back/Home/Recents + tap/swipe)
 
 ## Build

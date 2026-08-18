@@ -132,9 +132,9 @@ pub enum MouseButton {
 /// [0..4]  magic = b"RPF1"
 /// [4..8]  width u32 LE
 /// [8..12] height u32 LE
-/// [12]    pixel format (1 = BGRA8, 2 = JPEG)
-/// [13]    compression (1 = zstd, 2 = jpeg)
-/// [14]    quality hint (jpeg quality 1-100 when format=jpeg)
+/// [12]    pixel format (1 = BGRA8, 2 = JPEG, 3 = H264)
+/// [13]    compression (1 = zstd, 2 = jpeg, 3 = h264)
+/// [14]    jpeg quality 1-100, or h264 keyframe flag (1 = IDR with SPS/PPS, 0 = P)
 /// [15]    reserved
 /// [16..]  payload bytes
 pub const FRAME_MAGIC: &[u8; 4] = b"RPF1";
@@ -142,10 +142,16 @@ pub const FRAME_HEADER_LEN: usize = 16;
 
 pub const FRAME_PIXEL_BGRA8: u8 = 1;
 pub const FRAME_PIXEL_JPEG: u8 = 2;
+pub const FRAME_PIXEL_H264: u8 = 3;
 pub const FRAME_COMPRESS_ZSTD: u8 = 1;
 pub const FRAME_COMPRESS_JPEG: u8 = 2;
+pub const FRAME_COMPRESS_H264: u8 = 3;
+pub const FRAME_H264_DELTA: u8 = 0;
+pub const FRAME_H264_KEY: u8 = 1;
 
 /// Default stream settings tuned for bandwidth over fidelity.
 pub const DEFAULT_JPEG_QUALITY: u8 = 40;
 pub const DEFAULT_STREAM_FPS: u16 = 12;
 pub const MAX_STREAM_FPS: u16 = 15;
+/// Android H.264 target bitrate (no audio).
+pub const DEFAULT_H264_BITRATE: u32 = 1_000_000;

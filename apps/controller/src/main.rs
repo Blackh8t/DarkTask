@@ -4,9 +4,13 @@ use futures_util::{SinkExt, StreamExt};
 use minifb::{Key, KeyRepeat, MouseButton as MfMouseButton, MouseMode, Window, WindowOptions};
 use remote_protocol::{
     ControlMessage, DeviceSummary, MouseButton, SessionMode, SessionRequest, SessionResponse,
-    FRAME_COMPRESS_JPEG, FRAME_COMPRESS_ZSTD, FRAME_HEADER_LEN, FRAME_MAGIC, FRAME_PIXEL_BGRA8,
-    FRAME_PIXEL_JPEG,
+    FRAME_COMPRESS_H264, FRAME_COMPRESS_JPEG, FRAME_COMPRESS_ZSTD, FRAME_HEADER_LEN, FRAME_MAGIC,
+    FRAME_PIXEL_BGRA8, FRAME_PIXEL_H264, FRAME_PIXEL_JPEG,
 };
+use openh264::decoder::Decoder;
+use openh264::formats::YUVSource;
+use openh264::nal_units;
+use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -155,12 +159,22 @@ async fn run_viewer(server: String, session: SessionResponse) -> Result<()> {
         frame_rx
             .blocking_recv()
             .ok_or_else(|| anyhow!("session closed before first frame"))?;
-        let first = latest_frame
-            .lock()
-            .unwrap()
-            .take()
-            .ok_or_else(|| anyhow!("session closed before first frame"))?;
-        let (mut width, mut height, mut pixels) = decode_frame(&first)?;
+        let first = loop {
+            let frame = latest_frame
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| anyhow!("session closed before first frame"))?;
+            match decode_frame(&frame) {
+                Ok(decoded) => break decoded,
+                Err(_) => {
+                    frame_rx
+                        .blocking_recv()
+                        .ok_or_else(|| anyhow!("session closed before first frame"))?;
+                }
+            }
+        };
+        let (mut width, mut height, mut pixels) = first;
         let mut window = Window::new(
             "Remote Platform v0.3",
             width,
@@ -274,6 +288,10 @@ fn decode_frame(frame: &[u8]) -> Result<(usize, usize, Vec<u32>)> {
         return Ok((width, height, pixels));
     }
 
+    if frame[12] == FRAME_PIXEL_H264 && frame[13] == FRAME_COMPRESS_H264 {
+        return decode_h264(payload, width, height);
+    }
+
     if frame[12] != FRAME_PIXEL_BGRA8 || frame[13] != FRAME_COMPRESS_ZSTD {
         return Err(anyhow!("unsupported frame format"));
     }
@@ -289,6 +307,45 @@ fn decode_frame(frame: &[u8]) -> Result<(usize, usize, Vec<u32>)> {
         pixels.push((r << 16) | (g << 8) | b);
     }
     Ok((width, height, pixels))
+}
+
+thread_local! {
+    static H264: RefCell<Option<Decoder>> = RefCell::new(None);
+}
+
+fn decode_h264(payload: &[u8], width: usize, height: usize) -> Result<(usize, usize, Vec<u32>)> {
+    let _ = (width, height);
+    H264.with(|slot| {
+        if slot.borrow().is_none() {
+            *slot.borrow_mut() = Some(Decoder::new().map_err(|e| anyhow!("h264 init: {e}"))?);
+        }
+        let mut dec = slot.borrow_mut();
+        let decoder = dec.as_mut().unwrap();
+        let mut out: Option<(usize, usize, Vec<u32>)> = None;
+        for nal in nal_units(payload) {
+            match decoder.decode(nal) {
+                Ok(Some(yuv)) => {
+                    let (dw, dh) = yuv.dimensions();
+                    if dw == 0 || dh == 0 {
+                        continue;
+                    }
+                    let mut rgb = vec![0u8; dw * dh * 3];
+                    yuv.write_rgb8(&mut rgb);
+                    let mut pixels = Vec::with_capacity(dw * dh);
+                    for px in rgb.chunks_exact(3) {
+                        pixels.push((px[0] as u32) << 16 | (px[1] as u32) << 8 | px[2] as u32);
+                    }
+                    out = Some((dw, dh, pixels));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    *dec = None;
+                    return Err(anyhow!("h264 decode failed: {e}"));
+                }
+            }
+        }
+        out.ok_or_else(|| anyhow!("h264 waiting for more nals"))
+    })
 }
 
 fn key_to_vk(key: Key) -> Option<u16> {

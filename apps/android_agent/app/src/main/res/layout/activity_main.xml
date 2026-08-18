@@ -153,7 +153,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="18dp"
-            android:text="Video only (no audio). Capture stays at the device resolution, then is downscaled to 1280px and JPEG 40 @ 12fps so the remote viewer stays fast."
+            android:text="Video only (no audio). Hardware H.264 at 1 Mbps, 1280px, 12fps. Windows endpoints still use JPEG."
             android:textColor="@color/muted"
             android:textSize="12sp" />
     </LinearLayout>

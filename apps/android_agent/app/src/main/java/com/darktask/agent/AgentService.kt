@@ -36,6 +36,7 @@ class AgentService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private val running = AtomicBoolean(false)
     @Volatile private var online = false
+    @Volatile private var inSession = false
     private var heartbeat: Runnable? = null
 
     override fun onBind(intent: Intent?): IBinder? = null

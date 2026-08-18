@@ -17,11 +17,14 @@ Binary websocket message:
 0       4      RPF1
 4       4      width, little-endian u32
 8       4      height, little-endian u32
-12      1      pixel format: 1 = BGRA8
-13      1      compression: 1 = zstd
-14      2      reserved
-16      ...    compressed desktop bytes
+12      1      pixel format: 1 = BGRA8, 2 = JPEG, 3 = H264
+13      1      compression: 1 = zstd, 2 = jpeg, 3 = h264
+14      1      jpeg quality, or h264 keyframe (1 = IDR+SPS/PPS, 0 = P)
+15      1      reserved
+16      ...    payload
 ```
+
+Windows agents send JPEG. Android agents send Annex-B H.264 (no audio).
 
 ## Control messages
 
