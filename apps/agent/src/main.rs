@@ -954,14 +954,14 @@ impl FrameCapture {
             }
 
             self.jpeg_buf.clear();
-            let encoder = Encoder::new(
-                &mut self.jpeg_buf,
-                self.width as u16,
-                self.height as u16,
-                ColorType::Bgra,
-            );
+            let encoder = Encoder::new(&mut self.jpeg_buf, self.quality);
             encoder
-                .encode(&self.pixels, self.quality)
+                .encode(
+                    &self.pixels,
+                    self.width as u16,
+                    self.height as u16,
+                    ColorType::Bgra,
+                )
                 .map_err(|e| anyhow!("jpeg encode failed: {e}"))?;
 
             let mut out = Vec::with_capacity(FRAME_HEADER_LEN + self.jpeg_buf.len());
