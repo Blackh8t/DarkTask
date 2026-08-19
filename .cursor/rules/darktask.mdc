@@ -12,7 +12,7 @@ Windows-first managed remote-control platform. Do not reuse IDs, tokens, or assu
 - GitHub: `Blackh8t/DarkTask`
 - Linux Rust server (`apps/server`) on the VPS behind Caddy (`rust.privateserver.im`)
 - Windows agent (`apps/agent`) + controller (`apps/controller`)
-- Android endpoint (`apps/android_agent`) — MediaProjection + Accessibility, H.264 no audio, RPF1
+- Android APK upload/download from the admin portal; install + enroll QR codes
 - Flutter technician app scaffold: `apps/mobile_controller` (not the Android endpoint)
 
 Not using Vercel or Supabase in this repo.

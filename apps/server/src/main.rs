@@ -3,7 +3,7 @@ use axum::{
     extract::{
         multipart::Multipart,
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, Query, State,
+        DefaultBodyLimit, Path, Query, State,
     },
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
@@ -567,6 +567,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/android", get(android_install_page))
         .route("/ws/agent", get(agent_ws))
         .route("/ws/session/{session_id}", get(session_ws))
+        .layer(DefaultBodyLimit::max(MAX_AGENT_BYTES))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -835,6 +836,8 @@ async fn android_download() -> Result<Response, (StatusCode, String)> {
 async fn android_install_page() -> Html<&'static str> {
     Html(ANDROID_INSTALL_HTML)
 }
+
+async fn agent_maintenance_ps1() -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")

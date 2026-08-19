@@ -45,8 +45,34 @@ $ServiceName = "DarkTaskAgent"
 $TaskName = "DarkTask Agent Maintenance"
 $Base = $Server.TrimEnd("/")
 
+function Stop-DarkTaskAgent {
+    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -ne "Stopped") {
+        Write-Host "Stopping $ServiceName ..."
+        Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+        $deadline = (Get-Date).AddSeconds(15)
+        while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 500
+            $svc.Refresh()
+            if ($svc.Status -eq "Stopped") { break }
+        }
+    }
+
+    sc.exe stop $ServiceName 2>$null | Out-Null
+    Start-Sleep -Milliseconds 500
+
+    # Worker sessions keep remote-agent.exe open after the service stops.
+    Get-Process -Name "remote-agent" -ErrorAction SilentlyContinue | ForEach-Object {
+        Write-Host "Stopping worker pid $($_.Id) ..."
+        Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Milliseconds 500
+}
+
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 New-Item -ItemType Directory -Force -Path $ProgramDataDir | Out-Null
+
+Stop-DarkTaskAgent
 
 Write-Host "Downloading latest agent from $Base ..."
 $latest = Invoke-RestMethod -Uri "$Base/api/v1/agent/latest" -UseBasicParsing
@@ -84,21 +110,37 @@ if (Test-Path $bundledMaint) {
     max_fps = $MaxFps
 } | ConvertTo-Json | Set-Content -Path $Config -Encoding UTF8
 
+# Full install from the portal always re-enrolls with the bundled token.
+$Identity = Join-Path $ProgramDataDir "identity.json"
+if (Test-Path $Identity) {
+    Write-Host "Removing saved device identity for re-enroll ..."
+    Remove-Item -Path $Identity -Force
+}
+
 icacls.exe $ProgramDataDir /inheritance:r | Out-Null
 icacls.exe $ProgramDataDir /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" | Out-Null
 
-sc.exe stop $ServiceName 2>$null | Out-Null
-sc.exe delete $ServiceName 2>$null | Out-Null
-Start-Sleep -Milliseconds 750
+if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
+    sc.exe delete $ServiceName 2>$null | Out-Null
+    $deadline = (Get-Date).AddSeconds(15)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 500
+        if (-not (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) { break }
+    }
+}
 
-$binPath = "`"$Exe`" service"
-sc.exe create $ServiceName binPath= $binPath start= auto obj= LocalSystem DisplayName= "DarkTask Remote Agent"
-if ($LASTEXITCODE -ne 0) { throw "Failed to create $ServiceName service." }
+$serviceBin = "`"$Exe`" service"
+New-Service `
+    -Name $ServiceName `
+    -BinaryPathName $serviceBin `
+    -DisplayName "DarkTask Remote Agent" `
+    -StartupType Automatic `
+    -Description "DarkTask managed remote access agent" `
+    -ErrorAction Stop | Out-Null
 
-sc.exe description $ServiceName "DarkTask managed remote access agent"
-sc.exe failure $ServiceName reset= 86400 actions= restart/5000/restart/5000/restart/5000
-sc.exe failureflag $ServiceName 1
-sc.exe start $ServiceName
+sc.exe failure $ServiceName reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
+sc.exe failureflag $ServiceName 1 | Out-Null
+Start-Service -Name $ServiceName
 
 if (-not $SkipUpdateTask) {
     $action = New-ScheduledTaskAction `
