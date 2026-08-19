@@ -13,7 +13,7 @@ param(
     [string]$EnrollToken = "__DARKTASK_ENROLL__",
 
     [Parameter(Mandatory = $false)]
-    [int]$MaxFps = 12,
+    [int]$MaxFps = 15,
 
     [Parameter(Mandatory = $false)]
     [switch]$SkipUpdateTask

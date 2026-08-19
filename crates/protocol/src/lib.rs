@@ -74,6 +74,8 @@ pub enum ServerToAgent {
 pub struct DeviceSummary {
     pub device_id: Uuid,
     pub hostname: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nickname: Option<String>,
     pub platform: String,
     pub arch: String,
     pub agent_version: String,
@@ -109,6 +111,15 @@ pub struct SessionResponse {
     pub status: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpecialAction {
+    CtrlAltDel,
+    OpenCmd,
+    OpenPowerShell,
+    OpenPowerShellAdmin,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum ControlMessage {
@@ -117,6 +128,7 @@ pub enum ControlMessage {
     MouseWheel { delta: i32 },
     Key { vk: u16, down: bool },
     SetQuality { jpeg_quality: u8, max_fps: u16 },
+    SpecialAction { action: SpecialAction },
     Ping { unix_ms: u64 },
 }
 
@@ -150,8 +162,10 @@ pub const FRAME_H264_DELTA: u8 = 0;
 pub const FRAME_H264_KEY: u8 = 1;
 
 /// Default stream settings tuned for bandwidth over fidelity.
-pub const DEFAULT_JPEG_QUALITY: u8 = 40;
-pub const DEFAULT_STREAM_FPS: u16 = 12;
-pub const MAX_STREAM_FPS: u16 = 15;
+pub const DEFAULT_JPEG_QUALITY: u8 = 32;
+pub const DEFAULT_STREAM_FPS: u16 = 15;
+pub const MAX_STREAM_FPS: u16 = 20;
+/// Max capture width on Windows — downscale larger desktops for bandwidth.
+pub const MAX_CAPTURE_WIDTH: u32 = 1280;
 /// Android H.264 target bitrate (no audio).
 pub const DEFAULT_H264_BITRATE: u32 = 1_000_000;

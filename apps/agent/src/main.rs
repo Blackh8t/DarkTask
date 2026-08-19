@@ -3,8 +3,9 @@ use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use remote_protocol::{
     AgentHello, AgentToServer, ControlMessage, EnrollRequest, EnrollResponse, Heartbeat,
-    MouseButton, ServerToAgent, SessionMode, SessionPeek, DEFAULT_JPEG_QUALITY, DEFAULT_STREAM_FPS,
-    FRAME_COMPRESS_JPEG, FRAME_HEADER_LEN, FRAME_MAGIC, FRAME_PIXEL_JPEG, MAX_STREAM_FPS,
+    MouseButton, ServerToAgent, SessionMode, SessionPeek, SpecialAction,
+    DEFAULT_JPEG_QUALITY, DEFAULT_STREAM_FPS, FRAME_COMPRESS_JPEG, FRAME_HEADER_LEN,
+    FRAME_MAGIC, FRAME_PIXEL_JPEG, MAX_CAPTURE_WIDTH, MAX_STREAM_FPS,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -47,15 +48,16 @@ use windows_sys::Win32::{
         DuplicateTokenEx, ImpersonateLoggedOnUser, RevertToSelf, SecurityImpersonation,
         TokenPrimary, TOKEN_ALL_ACCESS,
     },
-    System::{
-        Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock},
-        RemoteDesktop::{
+        System::{
+            Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock},
+            LibraryLoader::{GetProcAddress, LoadLibraryW},
+            RemoteDesktop::{
             WTSActive, WTSConnectState, WTSGetActiveConsoleSessionId, WTSQuerySessionInformationW,
             WTSQueryUserToken, WTSUserName, WTS_CURRENT_SERVER_HANDLE,
         },
         Threading::{
-            CreateProcessAsUserW, CREATE_UNICODE_ENVIRONMENT,
-            PROCESS_INFORMATION, STARTUPINFOW,
+            CreateProcessAsUserW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTF_USESHOWWINDOW,
+            STARTUPINFOW,
         },
         SystemInformation::GetTickCount,
     },
@@ -70,6 +72,7 @@ const APP_DIR: &str = "DarkTask";
 const INSTALL_DIR: &str = r"C:\Program Files\DarkTask";
 const INSTALLED_EXE: &str = r"C:\Program Files\DarkTask\remote-agent.exe";
 const USER_DESKTOP: &str = r"winsta0\default";
+const CAPTURE_BLIT: u32 = SRCCOPY | CAPTUREBLT;
 /// Presence ping interval while idle (no remote session).
 const HEARTBEAT_SECS: u64 = 60;
 const STOP_POLL_SECS: u64 = 5;
@@ -807,21 +810,26 @@ fn quote_arg(s: &str) -> String {
 }
 
 #[cfg(windows)]
-fn spawn_interactive_worker(
-    server: &str,
-    session_id: Uuid,
-    session_token: &str,
-    max_fps: u16,
-) -> Result<()> {
+fn scaled_capture_size(full_w: i32, full_h: i32) -> (i32, i32) {
+    if full_w <= MAX_CAPTURE_WIDTH as i32 {
+        return (full_w, full_h);
+    }
+    let out_w = MAX_CAPTURE_WIDTH as i32;
+    let out_h = ((full_h as i64 * out_w as i64) / full_w as i64).max(1) as i32;
+    (out_w, out_h)
+}
+
+#[cfg(windows)]
+fn spawn_in_user_session(command: &str) -> Result<()> {
     unsafe {
-        let session_id_os = WTSGetActiveConsoleSessionId();
-        if session_id_os == u32::MAX {
+        let session_id = WTSGetActiveConsoleSessionId();
+        if session_id == u32::MAX {
             return Err(anyhow!("no active interactive Windows session"));
         }
 
         let mut user_token: HANDLE = ptr::null_mut();
-        if WTSQueryUserToken(session_id_os, &mut user_token) == 0 {
-            return Err(anyhow!("WTSQueryUserToken failed; service must run as LocalSystem"));
+        if WTSQueryUserToken(session_id, &mut user_token) == 0 {
+            return Err(anyhow!("WTSQueryUserToken failed"));
         }
 
         let mut primary_token: HANDLE = ptr::null_mut();
@@ -837,22 +845,14 @@ fn spawn_interactive_worker(
             return Err(anyhow!("DuplicateTokenEx failed"));
         }
 
-        let exe = std::env::current_exe()?;
-        let command = format!(
-            "{} worker --server {} --session-id {} --session-token {} --max-fps {}",
-            quote_arg(&exe.to_string_lossy()),
-            quote_arg(server),
-            session_id,
-            quote_arg(session_token),
-            max_fps,
-        );
-
-        let mut command_w = wide(&command);
+        let mut command_w = wide(command);
         let desktop_w = wide(USER_DESKTOP);
 
         let mut startup: STARTUPINFOW = mem::zeroed();
         startup.cb = mem::size_of::<STARTUPINFOW>() as u32;
         startup.lpDesktop = desktop_w.as_ptr() as *mut u16;
+        startup.dwFlags = STARTF_USESHOWWINDOW;
+        startup.wShowWindow = SW_SHOW as u16;
 
         let mut process: PROCESS_INFORMATION = mem::zeroed();
         let mut env: *mut core::ffi::c_void = ptr::null_mut();
@@ -885,10 +885,61 @@ fn spawn_interactive_worker(
             return Err(anyhow!("CreateProcessAsUserW failed"));
         }
 
-        CloseHandle(process.hThread);
         CloseHandle(process.hProcess);
+        CloseHandle(process.hThread);
         Ok(())
     }
+}
+
+#[cfg(windows)]
+fn send_ctrl_alt_del() -> Result<()> {
+    unsafe {
+        let dll = LoadLibraryW(wide("sas.dll").as_ptr());
+        if dll.is_null() {
+            return Err(anyhow!("sas.dll not available on this endpoint"));
+        }
+        let proc = GetProcAddress(dll, b"SendSAS\0".as_ptr() as *const u8);
+        let Some(proc) = proc else {
+            return Err(anyhow!("SendSAS export not found"));
+        };
+        type SendSasFn = unsafe extern "system" fn(i32);
+        let send_sas: SendSasFn = mem::transmute(proc);
+        send_sas(0);
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn apply_special_action(action: SpecialAction) -> Result<()> {
+    match action {
+        SpecialAction::CtrlAltDel => send_ctrl_alt_del(),
+        SpecialAction::OpenCmd => spawn_in_user_session("cmd.exe"),
+        SpecialAction::OpenPowerShell => {
+            spawn_in_user_session(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+        }
+        SpecialAction::OpenPowerShellAdmin => spawn_in_user_session(
+            "powershell.exe -NoProfile -Command \"Start-Process powershell -Verb RunAs\"",
+        ),
+    }
+}
+
+#[cfg(windows)]
+fn spawn_interactive_worker(
+    server: &str,
+    session_id: Uuid,
+    session_token: &str,
+    max_fps: u16,
+) -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let command = format!(
+        "{} worker --server {} --session-id {} --session-token {} --max-fps {}",
+        quote_arg(&exe.to_string_lossy()),
+        quote_arg(server),
+        session_id,
+        quote_arg(session_token),
+        max_fps,
+    );
+    spawn_in_user_session(&command)
 }
 
 #[cfg(not(windows))]
@@ -986,16 +1037,18 @@ impl FrameCapture {
 
     fn capture(&mut self) -> Result<Vec<u8>> {
         unsafe {
-            let width = GetSystemMetrics(SM_CXSCREEN);
-            let height = GetSystemMetrics(SM_CYSCREEN);
-            if width <= 0 || height <= 0 {
+            let screen_w = GetSystemMetrics(SM_CXSCREEN);
+            let screen_h = GetSystemMetrics(SM_CYSCREEN);
+            if screen_w <= 0 || screen_h <= 0 {
                 return Err(anyhow!("invalid desktop dimensions"));
             }
-            if width != self.width || height != self.height {
-                *self = Self::new(width, height)?;
+
+            let (out_w, out_h) = scaled_capture_size(screen_w, screen_h);
+            if out_w != self.width || out_h != self.height {
+                *self = Self::new(out_w, out_h)?;
             }
 
-            if BitBlt(
+            if StretchBlt(
                 self.mem_dc,
                 0,
                 0,
@@ -1004,10 +1057,12 @@ impl FrameCapture {
                 self.screen,
                 0,
                 0,
-                SRCCOPY,
+                screen_w,
+                screen_h,
+                CAPTURE_BLIT,
             ) == 0
             {
-                return Err(anyhow!("BitBlt failed"));
+                return Err(anyhow!("StretchBlt failed"));
             }
 
             let rows = GetDIBits(
@@ -1093,7 +1148,9 @@ async fn run_remote_session(
 
     let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
     let height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-    let mut capture = FrameCapture::new(width, height)?;
+    let (cap_w, cap_h) = scaled_capture_size(width, height);
+    let capture = Arc::new(std::sync::Mutex::new(FrameCapture::new(cap_w, cap_h)?));
+    let capture_for_control = capture.clone();
 
     let send_task = tokio::spawn(async move {
         let mut frame_rx = frame_rx;
@@ -1108,6 +1165,9 @@ async fn run_remote_session(
             if tx.send(Message::Binary(frame.into())).await.is_err() {
                 break;
             }
+            while frame_rx.has_changed().is_ok_and(|changed| changed) {
+                let _ = frame_rx.changed().await;
+            }
         }
     });
 
@@ -1120,7 +1180,7 @@ async fn run_remote_session(
                 match msg? {
                     Message::Text(text) => {
                         if let Ok(control) = serde_json::from_str::<ControlMessage>(&text) {
-                            apply_control(control)?;
+                            apply_control(control, &capture_for_control)?;
                         }
                     }
                     Message::Close(_) => break,
@@ -1129,7 +1189,11 @@ async fn run_remote_session(
             }
 
             _ = ticker.tick() => {
-                match capture.capture() {
+                let frame = {
+                    let mut cap = capture.lock().map_err(|_| anyhow!("capture lock poisoned"))?;
+                    cap.capture()
+                };
+                match frame {
                     Ok(frame) => {
                         let _ = frame_tx.send(frame);
                     }
@@ -1144,7 +1208,10 @@ async fn run_remote_session(
 }
 
 #[cfg(windows)]
-fn apply_control(msg: ControlMessage) -> Result<()> {
+fn apply_control(
+    msg: ControlMessage,
+    capture: &Arc<std::sync::Mutex<FrameCapture>>,
+) -> Result<()> {
     unsafe {
         match msg {
             ControlMessage::MouseMove { x_norm, y_norm } => {
@@ -1182,7 +1249,19 @@ fn apply_control(msg: ControlMessage) -> Result<()> {
                 keybd_event(vk as u8, 0, flags, 0);
             }
 
-            ControlMessage::SetQuality { .. } | ControlMessage::Ping { .. } => {}
+            ControlMessage::SetQuality { jpeg_quality, .. } => {
+                if let Ok(mut cap) = capture.lock() {
+                    cap.quality = jpeg_quality.clamp(20, 85);
+                }
+            }
+
+            ControlMessage::SpecialAction { action } => {
+                if let Err(e) = apply_special_action(action) {
+                    warn!(error=%e, ?action, "special action failed");
+                }
+            }
+
+            ControlMessage::Ping { .. } => {}
         }
     }
 

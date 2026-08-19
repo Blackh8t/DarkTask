@@ -7,7 +7,7 @@ use axum::{
     },
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
     Json, Router,
 };
 use dashmap::DashMap;
@@ -73,10 +73,21 @@ struct AdminBootstrap {
     server_url: String,
     install_ps1_url: String,
     install_command: String,
+    agent_download_url: String,
     android_page_url: String,
     android_download_url: String,
     android_qr_svg: String,
     enroll_qr_svg: String,
+}
+
+#[derive(Deserialize)]
+struct ConfirmAction {
+    confirm: bool,
+}
+
+#[derive(Deserialize)]
+struct UpdateDeviceRequest {
+    nickname: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -395,28 +406,41 @@ fn init_db(path: &PathBuf) -> anyhow::Result<Connection> {
         );
         "#,
     )?;
+    migrate_db(&conn)?;
     Ok(conn)
+}
+
+fn migrate_db(conn: &Connection) -> anyhow::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(devices)")?;
+    let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let has_nickname = cols.filter_map(Result::ok).any(|c| c == "nickname");
+    if !has_nickname {
+        conn.execute("ALTER TABLE devices ADD COLUMN nickname TEXT", [])?;
+    }
+    Ok(())
 }
 
 fn load_devices(conn: &Connection) -> anyhow::Result<DashMap<Uuid, DeviceRecord>> {
     let out = DashMap::new();
     let mut stmt = conn.prepare(
-        "SELECT device_id, hostname, platform, arch, agent_version, device_token_hash, last_seen_unix_ms FROM devices",
+        "SELECT device_id, hostname, nickname, platform, arch, agent_version, device_token_hash, last_seen_unix_ms FROM devices",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(2)?,
             row.get::<_, String>(3)?,
             row.get::<_, String>(4)?,
             row.get::<_, String>(5)?,
-            row.get::<_, i64>(6)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, i64>(7)?,
         ))
     })?;
 
     for row in rows {
-        let (id, hostname, platform, arch, agent_version, device_token_hash, last_seen) = row?;
+        let (id, hostname, nickname, platform, arch, agent_version, device_token_hash, last_seen) =
+            row?;
         let device_id = Uuid::parse_str(&id)?;
         out.insert(
             device_id,
@@ -424,6 +448,7 @@ fn load_devices(conn: &Connection) -> anyhow::Result<DashMap<Uuid, DeviceRecord>
                 summary: DeviceSummary {
                     device_id,
                     hostname,
+                    nickname,
                     platform,
                     arch,
                     agent_version,
@@ -551,7 +576,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/enroll", post(enroll))
         .route("/api/v1/devices", get(list_devices))
         .route("/api/v1/devices/{device_id}/session", post(request_session))
-        .route("/api/v1/devices/{device_id}", delete(delete_device))
+        .route(
+            "/api/v1/devices/{device_id}",
+            delete(delete_device).patch(update_device),
+        )
         .route("/api/v1/admin/bootstrap", get(admin_bootstrap))
         .route("/api/v1/admin/token/enroll", post(rotate_enroll_token))
         .route("/api/v1/admin/token/admin", post(rotate_admin_token))
@@ -601,6 +629,7 @@ async fn admin_bootstrap(
     );
     let android_page_url = format!("{server_url}/android");
     let android_download_url = format!("{server_url}/api/v1/android/download");
+    let agent_download_url = format!("{server_url}/api/v1/agent/download");
     let enroll_uri = format!(
         "darktask://enroll?server={}&token={}",
         url_encode(&server_url),
@@ -616,6 +645,7 @@ async fn admin_bootstrap(
         server_url: server_url.clone(),
         install_ps1_url,
         install_command,
+        agent_download_url,
         android_page_url,
         android_download_url,
         android_qr_svg,
@@ -863,8 +893,15 @@ async fn agent_maintenance_ps1() -> Response {
 async fn rotate_enroll_token(
     headers: HeaderMap,
     State(state): State<AppState>,
+    Json(body): Json<ConfirmAction>,
 ) -> Result<Json<TokenResponse>, (StatusCode, String)> {
     require_admin(&headers, &state)?;
+    if !body.confirm {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "token rotation requires {\"confirm\":true}".into(),
+        ));
+    }
     let token = random_token();
     write_secret(&secret_file(&state.secret_dir, "enroll"), &token)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -878,8 +915,15 @@ async fn rotate_enroll_token(
 async fn rotate_admin_token(
     headers: HeaderMap,
     State(state): State<AppState>,
+    Json(body): Json<ConfirmAction>,
 ) -> Result<Json<TokenResponse>, (StatusCode, String)> {
     require_admin(&headers, &state)?;
+    if !body.confirm {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "token rotation requires {\"confirm\":true}".into(),
+        ));
+    }
     let token = random_token();
     write_secret(&secret_file(&state.secret_dir, "admin"), &token)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -904,6 +948,7 @@ async fn enroll(
     let summary = DeviceSummary {
         device_id,
         hostname: req.hostname,
+        nickname: None,
         platform: req.platform,
         arch: req.arch,
         agent_version: req.agent_version,
@@ -917,10 +962,11 @@ async fn enroll(
             (StatusCode::INTERNAL_SERVER_ERROR, "database lock poisoned".into())
         })?;
         db.execute(
-            "INSERT INTO devices (device_id, hostname, platform, arch, agent_version, device_token_hash, last_seen_unix_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO devices (device_id, hostname, nickname, platform, arch, agent_version, device_token_hash, last_seen_unix_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 summary.device_id.to_string(),
                 summary.hostname,
+                summary.nickname,
                 summary.platform,
                 summary.arch,
                 summary.agent_version,
@@ -952,8 +998,58 @@ async fn list_devices(
 ) -> Result<Json<Vec<DeviceSummary>>, (StatusCode, String)> {
     require_admin(&headers, &state)?;
     let mut out: Vec<_> = state.devices.iter().map(|d| d.summary.clone()).collect();
-    out.sort_by(|a, b| a.hostname.cmp(&b.hostname));
+    out.sort_by(|a, b| {
+        let la = a
+            .nickname
+            .as_deref()
+            .filter(|n| !n.is_empty())
+            .unwrap_or(&a.hostname);
+        let lb = b
+            .nickname
+            .as_deref()
+            .filter(|n| !n.is_empty())
+            .unwrap_or(&b.hostname);
+        la.cmp(lb)
+    });
     Ok(Json(out))
+}
+
+async fn update_device(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(device_id): Path<Uuid>,
+    Json(req): Json<UpdateDeviceRequest>,
+) -> Result<Json<DeviceSummary>, (StatusCode, String)> {
+    require_admin(&headers, &state)?;
+
+    let nickname = req.nickname.and_then(|raw| {
+        let trimmed = raw.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    });
+
+    let Some(mut record) = state.devices.get_mut(&device_id) else {
+        return Err((StatusCode::NOT_FOUND, "unknown device".into()));
+    };
+    record.summary.nickname = nickname.clone();
+    let summary = record.summary.clone();
+    drop(record);
+
+    {
+        let db = state.db.lock().map_err(|_| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "database lock poisoned".into())
+        })?;
+        db.execute(
+            "UPDATE devices SET nickname=?1 WHERE device_id=?2",
+            params![nickname, device_id.to_string()],
+        )
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    Ok(Json(summary))
 }
 
 async fn delete_device(
@@ -1238,7 +1334,12 @@ button,input{font:inherit}.shell{max-width:1200px;margin:auto;padding:28px}.top{
 .mono{font:12px ui-monospace,SFMono-Regular,Consolas,monospace}.code{background:#090c12;border:1px solid var(--b);border-radius:10px;padding:12px;word-break:break-all}.label{color:var(--m);font-size:11px;text-transform:uppercase;letter-spacing:.08em;margin:15px 0 7px}
 .toolbar{display:flex;gap:8px}.login{max-width:min(720px,94vw);margin:14vh auto}.login .body{padding:26px}.login p{color:var(--m)}input{width:100%;padding:12px;background:#090c12;border:1px solid var(--b);border-radius:10px;color:var(--t)}
 .hidden{display:none!important}.empty{padding:28px;text-align:center;color:var(--m)}.notice{margin-top:12px;padding:11px;background:#101824;border:1px solid #203756;border-radius:10px;color:#afd0ff}
+.tabs{display:flex;gap:6px}.tab.active{background:#edf1f7;color:#090b10;font-weight:700;border-color:#edf1f7}
+.nick{width:100%;background:transparent;border:1px solid transparent;border-radius:8px;padding:4px 6px;font-weight:700;color:var(--t)}.nick:hover{border-color:var(--b)}.nick:focus{border-color:var(--blue);outline:none;background:#090c12}
+.modal{position:fixed;inset:0;background:#0009;display:flex;align-items:center;justify-content:center;z-index:2000;padding:20px}.modalbox{background:var(--p);border:1px solid var(--b);border-radius:14px;padding:20px;max-width:420px;width:100%}
+.qrpanel{margin-top:12px;padding-top:12px;border-top:1px solid var(--b)}
 .qrrow{display:flex;gap:16px;flex-wrap:wrap;margin-top:12px}.qrbox{width:176px}.qr{background:#eef2f7;border-radius:12px;padding:8px;min-height:160px}.qr svg{display:block;width:100%;height:auto}
+.vieweractions{height:40px;background:#0a0e14;border-bottom:1px solid var(--b);display:flex;align-items:center;gap:6px;padding:0 10px;flex-wrap:wrap}.vieweractions .btn{font-size:11px;padding:4px 10px;min-height:28px}.vieweractions .btn.active{background:var(--blue);color:#000;border-color:var(--blue)}
 .viewer{position:fixed;right:24px;bottom:24px;width:min(900px,72vw);height:min(680px,72vh);background:#050608;z-index:1000;display:flex;flex-direction:column;border:1px solid var(--b);border-radius:14px;overflow:hidden;box-shadow:0 24px 80px #000a}.viewerbar{height:52px;background:#0d1118;border-bottom:1px solid var(--b);display:flex;align-items:center;gap:10px;padding:0 14px}.viewerbar .grow{flex:1}.stage{flex:1;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#000}.stage canvas{max-width:100%;max-height:100%;outline:none}.danger{color:#ff9aa4}.iconbtn{width:34px;height:34px;padding:0;display:inline-flex;align-items:center;justify-content:center;font-size:18px;line-height:1}.device-actions{display:flex;gap:7px;align-items:center}@media(max-width:900px){.viewer{right:10px;bottom:10px;width:calc(100vw - 20px);height:65vh}}@media(max-width:850px){.grid{grid-template-columns:1fr}.device{grid-template-columns:1fr auto}.hide-sm{display:none}}
 </style>
 </head>
@@ -1256,42 +1357,56 @@ button,input{font:inherit}.shell{max-width:1200px;margin:auto;padding:28px}.top{
 
 <div id="app" class="shell hidden">
 <div class="top"><div><div class="brand">Dark<span>Task</span></div><div class="sub">Managed remote access</div></div>
+<div class="tabs"><button class="btn tab active" id="tabMain" onclick="setTab('main')">Console</button><button class="btn tab" id="tabSettings" onclick="setTab('settings')">Settings</button></div>
 <div class="toolbar"><div id="server" class="sub"></div><button class="btn" onclick="logout()">Lock</button></div></div>
+
+<div id="panelMain">
 <div class="grid">
-<div class="card"><div class="head"><h2>Devices</h2><button class="btn" onclick="devices()">Refresh</button></div><div id="devices"><div class="empty">Loading…</div></div><div class="sub" style="padding:10px 18px 14px;border-top:1px solid var(--b)">Session peek updates every 60s · active = input within 5 minutes</div></div>
-<div>
-<div class="card"><div class="head"><h2>Enroll a device</h2></div><div class="body">
-<div class="label">Enrollment token</div><div id="enroll" class="code mono">—</div>
-<div class="toolbar" style="margin-top:9px"><button class="btn" onclick="copy('enroll')">Copy token</button><button class="btn" onclick="rotateEnroll()">Rotate</button></div>
-<div class="label">Android</div>
-<div class="sub" style="margin-bottom:8px">Scan <strong>Install</strong> with the phone camera, then scan <strong>Enroll</strong> after DarkTask is installed. Video is H.264, no audio.</div>
-<div class="qrrow"><div class="qrbox"><div class="label">1. Install</div><div id="apkqr" class="qr"></div><div class="sub" style="margin-top:6px">Opens the APK page</div></div><div class="qrbox"><div class="label">2. Enroll</div><div id="enrollqr" class="qr"></div><div class="sub" style="margin-top:6px">Opens DarkTask with server + token</div></div></div>
-<div class="toolbar" style="margin-top:12px"><button class="btn primary" onclick="downloadApk()">Download APK</button><button class="btn" onclick="copy('androidpage')">Copy install URL</button></div>
-<div id="androidpage" class="code mono" style="margin-top:9px">—</div>
+<div class="card"><div class="head"><h2>Devices</h2><button class="btn" onclick="devices()">Refresh</button></div><div id="devices"><div class="empty">Loading…</div></div><div class="sub" style="padding:10px 18px 14px;border-top:1px solid var(--b)">Click a nickname to edit · session peek every 60s</div></div>
+<div class="card"><div class="head"><h2>Enroll</h2><button class="btn" onclick="reloadAll()">Reload</button></div><div class="body">
+<div id="enroll" class="hidden">—</div>
+<div class="toolbar" style="flex-wrap:wrap"><button class="btn primary" onclick="copyEnroll()">Copy enrollment</button><button class="btn" onclick="downloadAgent()">Download agent</button><button class="btn" onclick="downloadInstall()">Download install.ps1</button><button class="btn" onclick="toggleQr('apk')">APK QR</button><button class="btn" onclick="toggleQr('enroll')">Enroll QR</button><button class="btn" onclick="reloadAll()">Refresh</button></div>
+<div id="apkQrPanel" class="qrpanel hidden"><div class="label">Install APK</div><div class="sub">Scan with the phone camera to open the APK page.</div><div id="apkqr" class="qr"></div></div>
+<div id="enrollQrPanel" class="qrpanel hidden"><div class="label">Enroll device</div><div class="sub">Scan after DarkTask is installed on the phone.</div><div id="enrollqr" class="qr"></div></div>
+</div></div>
+</div></div>
+
+<div id="panelSettings" class="hidden">
+<div class="grid" style="grid-template-columns:1fr">
+<div class="card"><div class="head"><h2>Tokens</h2></div><div class="body">
+<div class="label">Enrollment token</div><div id="settingsEnroll" class="code mono">—</div>
+<div class="toolbar" style="margin-top:9px"><button class="btn" onclick="copy('settingsEnroll')">Copy</button><button class="btn" onclick="confirmRotateEnroll()">Rotate enroll token</button></div>
+<div class="label">Install commands</div>
+<div class="sub">Elevated one-liner for new Windows endpoints.</div>
+<div id="installcmd" class="code mono">—</div>
+<div class="toolbar" style="margin-top:9px"><button class="btn" onclick="copy('installcmd')">Copy one-liner</button><button class="btn" onclick="copy('command')">Copy manual command</button></div>
+<div id="command" class="code mono" style="margin-top:9px">—</div>
+<div class="label">Android install URL</div><div id="androidpage" class="code mono">—</div>
+</div></div>
+<div class="card" style="margin-top:18px"><div class="head"><h2>Agent release</h2><button class="btn" onclick="refreshAgentRelease()">Refresh</button></div><div class="body">
+<div class="sub">Upload <span class="mono">remote-agent.exe</span> for install.ps1 and silent updates.</div>
+<div class="label">Current release</div><div id="agentrelease" class="code mono">—</div>
+<input id="agentfile" type="file" accept=".exe,application/octet-stream,application/x-msdownload" style="margin-top:8px">
+<input id="agentversion" type="text" placeholder="Version label (optional)" style="margin-top:8px">
+<div class="toolbar" style="margin-top:9px"><button class="btn primary" onclick="uploadAgent()">Upload agent</button></div>
+<div id="agentuploadmsg" class="notice hidden"></div>
+</div></div>
+<div class="card" style="margin-top:18px"><div class="head"><h2>Android APK</h2><button class="btn" onclick="refreshApkRelease()">Refresh</button></div><div class="body">
 <div class="label">Current APK</div><div id="apkrelease" class="code mono">—</div>
 <input id="apkfile" type="file" accept=".apk,application/vnd.android.package-archive" style="margin-top:8px">
 <input id="apkversion" type="text" placeholder="Version label (optional)" style="margin-top:8px">
-<div class="toolbar" style="margin-top:9px"><button class="btn primary" onclick="uploadApk()">Upload APK</button></div>
+<div class="toolbar" style="margin-top:9px"><button class="btn primary" onclick="uploadApk()">Upload APK</button><button class="btn" onclick="downloadApk()">Download APK</button></div>
 <div id="apkuploadmsg" class="notice hidden"></div>
-<div class="label">install.ps1 (service + reboot task + silent updates)</div>
-<div class="sub" style="margin-bottom:8px">Run elevated on the target PC. Registers a scheduled task at startup and daily to keep the agent running and auto-update.</div>
-<div class="toolbar" style="margin-top:9px"><button class="btn primary" onclick="downloadInstall()">Download install.ps1</button><button class="btn" onclick="copy('installcmd')">Copy elevated one-liner</button></div>
-<div class="label">Elevated one-liner</div><div id="installcmd" class="code mono">—</div>
-<div class="label">Manual install (script already downloaded)</div><div id="command" class="code mono">—</div><button class="btn" style="margin-top:9px" onclick="copy('command')">Copy manual command</button>
-</div></div>
-<div class="card" style="margin-top:18px"><div class="head"><h2>Agent release</h2></div><div class="body">
-<div class="sub">Upload <span class="mono">remote-agent.exe</span> here. Endpoints install and silently update from this file.</div>
-<div class="label">Current release</div><div id="agentrelease" class="code mono">—</div>
-<div class="label">Upload new agent</div>
-<input id="agentfile" type="file" accept=".exe,application/octet-stream,application/x-msdownload">
-<input id="agentversion" type="text" placeholder="Version label (optional, e.g. 0.3.1)" style="margin-top:8px">
-<div class="toolbar" style="margin-top:9px"><button class="btn primary" onclick="uploadAgent()">Upload agent</button><button class="btn" onclick="refreshAgentRelease()">Refresh</button></div>
-<div id="agentuploadmsg" class="notice hidden"></div>
 </div></div>
 <div class="card" style="margin-top:18px"><div class="head"><h2>Security</h2></div><div class="body">
-<div class="sub">Rotate the admin token if it has been exposed.</div><button class="btn" style="margin-top:12px" onclick="rotateAdmin()">Rotate admin token</button><div id="newadmin" class="notice hidden"></div>
+<div class="sub">Rotating the admin token invalidates the current session token.</div>
+<button class="btn" style="margin-top:12px" onclick="confirmRotateAdmin()">Rotate admin token</button>
+<div id="newadmin" class="notice hidden"></div>
 </div></div>
-</div></div></div>
+</div></div>
+</div>
+
+<div id="modal" class="modal hidden"><div class="modalbox"><p id="modalText"></p><div class="toolbar" style="margin-top:16px;justify-content:flex-end"><button class="btn" onclick="modalCancel()">Cancel</button><button class="btn primary" onclick="modalOk()">OK</button></div></div></div>
 
 
 <div id="viewer" class="viewer hidden">
@@ -1301,6 +1416,13 @@ button,input{font:inherit}.shell{max-width:1200px;margin:auto;padding:28px}.top{
     <div class="grow"></div>
     <button class="btn" onclick="toggleFullscreen()">Fullscreen</button>
     <button class="btn danger" onclick="disconnectViewer()">Disconnect</button>
+  </div>
+  <div class="vieweractions">
+    <button class="btn" id="btnCad" onclick="specialAction('ctrl_alt_del')">Ctrl+Alt+Del</button>
+    <button class="btn" id="btnShift" onclick="toggleShift()" title="Toggle Shift on endpoint (slower mouse while active)">Shift</button>
+    <button class="btn" onclick="specialAction('open_cmd')">CMD</button>
+    <button class="btn" onclick="specialAction('open_power_shell')">PS</button>
+    <button class="btn" onclick="specialAction('open_power_shell_admin')">PS Admin</button>
   </div>
   <div class="stage"><canvas id="screen" tabindex="0"></canvas></div>
 </div>
@@ -1316,8 +1438,18 @@ document.getElementById('token').addEventListener('input',loginInstallCmd);
 loginInstallCmd();
 async function login(){tok=document.getElementById('token').value.trim();try{await A('/api/v1/admin/bootstrap');sessionStorage.setItem('darktask_admin',tok);show()}catch(e){let x=document.getElementById('err');x.textContent=e.message;x.classList.remove('hidden')}}
 function logout(){tok='';sessionStorage.removeItem('darktask_admin');if(deviceRefresh){clearInterval(deviceRefresh);deviceRefresh=null}document.getElementById('app').classList.add('hidden');document.getElementById('login').classList.remove('hidden')}
-async function show(){document.getElementById('login').classList.add('hidden');document.getElementById('app').classList.remove('hidden');await Promise.all([boot(),devices(),refreshAgentRelease(),refreshApkRelease()]);if(deviceRefresh)clearInterval(deviceRefresh);deviceRefresh=setInterval(devices,60000)}
-async function boot(){let x=await A('/api/v1/admin/bootstrap');document.getElementById('enroll').textContent=x.enrollment_token;document.getElementById('command').textContent=x.agent_command;document.getElementById('installcmd').textContent=x.install_command;document.getElementById('server').textContent=x.server_url;document.getElementById('androidpage').textContent=x.android_page_url;document.getElementById('apkqr').innerHTML=x.android_qr_svg||'';document.getElementById('enrollqr').innerHTML=x.enroll_qr_svg||'';window.__installPs1Url=x.install_ps1_url;window.__apkUrl=x.android_download_url}
+async function show(){document.getElementById('login').classList.add('hidden');document.getElementById('app').classList.remove('hidden');setTab('main');await reloadAll();if(deviceRefresh)clearInterval(deviceRefresh);deviceRefresh=setInterval(devices,60000)}
+async function boot(){let x=await A('/api/v1/admin/bootstrap');document.getElementById('enroll').textContent=x.enrollment_token;document.getElementById('settingsEnroll').textContent=x.enrollment_token;document.getElementById('command').textContent=x.agent_command;document.getElementById('installcmd').textContent=x.install_command;document.getElementById('server').textContent=x.server_url;document.getElementById('androidpage').textContent=x.android_page_url;document.getElementById('apkqr').innerHTML=x.android_qr_svg||'';document.getElementById('enrollqr').innerHTML=x.enroll_qr_svg||'';window.__installPs1Url=x.install_ps1_url;window.__apkUrl=x.android_download_url;window.__agentUrl=x.agent_download_url}
+async function reloadAll(){await Promise.all([boot(),devices()])}
+function setTab(name){const main=name==='main';document.getElementById('panelMain').classList.toggle('hidden',!main);document.getElementById('panelSettings').classList.toggle('hidden',main);document.getElementById('tabMain').classList.toggle('active',main);document.getElementById('tabSettings').classList.toggle('active',!main);if(!main)Promise.all([refreshAgentRelease(),refreshApkRelease()])}
+function copyEnroll(){copy('enroll')}
+function downloadAgent(){window.open(window.__agentUrl||'/api/v1/agent/download','_blank')}
+function toggleQr(kind){const id=kind==='apk'?'apkQrPanel':'enrollQrPanel';document.getElementById(id).classList.toggle('hidden')}
+let modalOkFn=null;function confirmDialog(msg,fn){document.getElementById('modalText').textContent=msg;modalOkFn=fn;document.getElementById('modal').classList.remove('hidden')}
+function modalCancel(){modalOkFn=null;document.getElementById('modal').classList.add('hidden')}
+function modalOk(){const fn=modalOkFn;modalOkFn=null;document.getElementById('modal').classList.add('hidden');if(fn)fn()}
+function confirmRotateEnroll(){confirmDialog('Rotate the enrollment token? Existing enroll links will stop working until you distribute the new token.',()=>rotateEnroll())}
+function confirmRotateAdmin(){confirmDialog('Rotate the admin token? You must save the new token and sign in again.',()=>rotateAdmin())}
 async function refreshApkRelease(){try{let x=await A('/api/v1/admin/android/release');document.getElementById('apkrelease').textContent=x.deployed?`v${x.version}  ·  ${(x.size_bytes/1024/1024).toFixed(2)} MB  ·  sha256 ${x.sha256.slice(0,16)}…`:'Not deployed — upload darktask.apk below.'}catch(e){document.getElementById('apkrelease').textContent='Unable to load APK info.'}}
 async function uploadApk(){const msg=document.getElementById('apkuploadmsg');msg.classList.add('hidden');const f=document.getElementById('apkfile').files[0];if(!f){alert('Choose the DarkTask APK first.');return}if(!confirm(`Upload ${f.name} (${(f.size/1024/1024).toFixed(2)} MB) as the Android client?`))return;try{const fd=new FormData();fd.append('file',f,f.name);const v=document.getElementById('apkversion').value.trim();if(v)fd.append('version',v);const r=await fetch('/api/v1/admin/android/upload',{method:'POST',headers:{Authorization:'Bearer '+tok},body:fd});const t=await r.text();if(r.status===401){logout();throw Error('Unauthorized')}if(!r.ok)throw Error(t||('HTTP '+r.status));msg.textContent='APK uploaded. Phones can scan Install or use Download APK.';msg.classList.remove('hidden');document.getElementById('apkfile').value='';await refreshApkRelease()}catch(e){alert(e.message)}}
 function downloadApk(){window.open(window.__apkUrl||'/api/v1/android/download','_blank')}
@@ -1326,8 +1458,10 @@ async function uploadAgent(){const msg=document.getElementById('agentuploadmsg')
 async function downloadInstall(){try{let r=await fetch(window.__installPs1Url||'/api/v1/admin/install.ps1',{headers:{Authorization:'Bearer '+tok}});if(r.status===401){logout();throw Error('Unauthorized')}if(!r.ok)throw Error(await r.text()||('HTTP '+r.status));let blob=await r.blob();let a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='install.ps1';a.click();URL.revokeObjectURL(a.href)}catch(e){alert(e.message)}}
 function fmtDuration(secs){if(secs<60)return secs+'s';const m=Math.floor(secs/60);if(m<60)return m+'m';return Math.floor(m/60)+'h '+(m%60)+'m'}
 function sessionPeek(d){if(!d.online||!d.session_peek)return{text:'—',cls:'none'};const p=d.session_peek;if(!p.user_logged_in)return{text:'No user session',cls:'none'};if(p.idle_secs==null)return{text:'Logged in',cls:'active'};if(p.idle_secs<60)return{text:'Active now',cls:'active'};if(p.idle_secs<ACTIVE_IDLE_SECS)return{text:'Used '+fmtDuration(p.idle_secs)+' ago',cls:'active'};return{text:'Idle · '+fmtDuration(p.idle_secs),cls:'idle'}}
-async function devices(){let a=await A('/api/v1/devices'),r=document.getElementById('devices');if(!a.length){r.innerHTML='<div class="empty">No enrolled devices</div>';return}r.innerHTML=a.map(d=>{const peek=sessionPeek(d);return `<div class="device"><div><div class="host">${E(d.hostname)}</div><div class="meta mono">${E(d.device_id)}</div></div><div class="hide-sm">${E(d.platform)} / ${E(d.arch)}<div class="meta">Agent ${E(d.agent_version)}</div></div><div class="peek ${peek.cls}">${E(peek.text)}</div><div class="status ${d.online?'online':''}"><span class="dot"></span>${d.online?'Online':'Offline'}</div><div class="device-actions"><button class="btn primary" ${d.online?'':'disabled'} onclick="connect('${d.device_id}','${EA(d.hostname)}')">Connect</button><button class="btn danger iconbtn" title="Delete client" aria-label="Delete client" onclick="deleteDevice('${d.device_id}','${EA(d.hostname)}')">×</button></div></div><div id="s-${d.device_id}" class="hidden"></div>`}).join('')}
-let sessionSocket=null,sessionPing=null,lastMove=0;
+async function devices(){let a=await A('/api/v1/devices'),r=document.getElementById('devices');if(!a.length){r.innerHTML='<div class="empty">No enrolled devices</div>';return}r.innerHTML=a.map(d=>{const peek=sessionPeek(d);const label=(d.nickname&&d.nickname.trim())?d.nickname:d.hostname;return `<div class="device"><div><input class="nick" value="${E(label)}" data-id="${d.device_id}" data-host="${EA(d.hostname)}" onblur="saveNick(this)" onkeydown="nickKey(event,this)" aria-label="Nickname"><div class="meta mono">${E(d.device_id)}</div>${d.nickname&&d.nickname.trim()?`<div class="meta">${E(d.hostname)}</div>`:''}</div><div class="hide-sm">${E(d.platform)} / ${E(d.arch)}<div class="meta">Agent ${E(d.agent_version)}</div></div><div class="peek ${peek.cls}">${E(peek.text)}</div><div class="status ${d.online?'online':''}"><span class="dot"></span>${d.online?'Online':'Offline'}</div><div class="device-actions"><button class="btn primary" ${d.online?'':'disabled'} onclick="connect('${d.device_id}','${EA(label)}')">Connect</button><button class="btn danger iconbtn" title="Delete client" aria-label="Delete client" onclick="deleteDevice('${d.device_id}','${EA(label)}')">×</button></div></div>`}).join('')}
+function nickKey(e,el){if(e.key==='Enter'){e.preventDefault();el.blur()}}
+async function saveNick(el){const id=el.dataset.id,host=el.dataset.host;let v=el.value.trim();if(!v)v=host;const nick=v===host?null:v;try{await A('/api/v1/devices/'+encodeURIComponent(id),{method:'PATCH',body:JSON.stringify({nickname:nick})});await devices()}catch(e){alert(e.message)}}
+let sessionSocket=null,sessionPing=null,lastMove=0,shiftHeld=false,frameBusy=false,pendingFrame=null;
 const canvas=document.getElementById('screen'),ctx=canvas.getContext('2d',{alpha:false});
 async function deleteDevice(id,host){
   if(!confirm(`Delete "${host}" from DarkTask?\n\nThis removes the saved server-side client identity. If the agent is still installed, it will need to be re-enrolled before reconnecting.`))return;
@@ -1343,18 +1477,20 @@ async function deleteDevice(id,host){
 }
 async function connect(id,host){try{let s=await A('/api/v1/devices/'+id+'/session',{method:'POST',body:JSON.stringify({controller_id:'web-admin'})});openViewer(host,s)}catch(e){alert(e.message)}}
 function wsBase(){return (location.protocol==='https:'?'wss://':'ws://')+location.host}
-function openViewer(host,s){disconnectViewer();document.getElementById('viewer').classList.remove('hidden');document.getElementById('viewerHost').textContent=host;let st=document.getElementById('viewerState');st.textContent='Connecting…';let ws=new WebSocket(wsBase()+'/ws/session/'+encodeURIComponent(s.session_id)+'?role=controller&token='+encodeURIComponent(s.session_token));sessionSocket=ws;ws.binaryType='arraybuffer';ws.onopen=()=>{st.textContent='Connected';sessionPing=setInterval(()=>sendControl({type:'ping',data:{unix_ms:Date.now()}}),5000)};ws.onclose=()=>{st.textContent='Disconnected';if(sessionPing){clearInterval(sessionPing);sessionPing=null}};ws.onerror=()=>st.textContent='Error';ws.onmessage=e=>{if(typeof e.data==='string')return;try{drawFrame(new Uint8Array(e.data))}catch(err){st.textContent='Frame decode error';console.error(err)}}}
-function disconnectViewer(){if(sessionPing){clearInterval(sessionPing);sessionPing=null}if(sessionSocket){try{sessionSocket.close()}catch{}sessionSocket=null}closeVdec();document.getElementById('viewer').classList.add('hidden')}
+function openViewer(host,s){disconnectViewer();document.getElementById('viewer').classList.remove('hidden');document.getElementById('viewerHost').textContent=host;let st=document.getElementById('viewerState');st.textContent='Connecting…';let ws=new WebSocket(wsBase()+'/ws/session/'+encodeURIComponent(s.session_id)+'?role=controller&token='+encodeURIComponent(s.session_token));sessionSocket=ws;ws.binaryType='arraybuffer';ws.onopen=()=>{st.textContent='Connected';sendControl({type:'set_quality',data:{jpeg_quality:32,max_fps:18}});sessionPing=setInterval(()=>sendControl({type:'ping',data:{unix_ms:Date.now()}}),5000)};ws.onclose=()=>{st.textContent='Disconnected';if(sessionPing){clearInterval(sessionPing);sessionPing=null}};ws.onerror=()=>st.textContent='Error';ws.onmessage=e=>{if(typeof e.data==='string')return;try{drawFrame(new Uint8Array(e.data))}catch(err){st.textContent='Frame decode error';console.error(err)}}}
+function disconnectViewer(){if(shiftHeld)toggleShift();if(sessionPing){clearInterval(sessionPing);sessionPing=null}if(sessionSocket){try{sessionSocket.close()}catch{}sessionSocket=null}closeVdec();pendingFrame=null;frameBusy=false;document.getElementById('viewer').classList.add('hidden')}
+function specialAction(action){sendControl({type:'special_action',data:{action:action}})}
+function toggleShift(){shiftHeld=!shiftHeld;sendControl({type:'key',data:{vk:16,down:shiftHeld}});document.getElementById('btnShift').classList.toggle('active',shiftHeld)}
 let vdec=null,vts=0,avcc=null;
 function closeVdec(){try{vdec&&vdec.close()}catch{}vdec=null;avcc=null}
 function splitNal(u){const nals=[];let i=0,start=-1;while(i+3<=u.length){let sc=0;if(u[i]===0&&u[i+1]===0&&u[i+2]===1)sc=3;else if(i+4<=u.length&&u[i]===0&&u[i+1]===0&&u[i+2]===0&&u[i+3]===1)sc=4;if(sc){if(start>=0)nals.push(u.subarray(start,i));i+=sc;start=i;continue}i++}if(start>=0&&start<u.length)nals.push(u.subarray(start));return nals}
 function avcCFromAnnexB(u){let sps,pps;for(const n of splitNal(u)){const t=n[0]&31;if(t===7)sps=n;else if(t===8)pps=n}if(!sps||!pps)return null;const b=new Uint8Array(11+sps.length+pps.length);b[0]=1;b[1]=sps[1];b[2]=sps[2];b[3]=sps[3];b[4]=0xFF;b[5]=0xE1;b[6]=sps.length>>8;b[7]=sps.length&255;b.set(sps,8);let o=8+sps.length;b[o]=1;b[o+1]=pps.length>>8;b[o+2]=pps.length&255;b.set(pps,o+3);return{desc:b,codec:'avc1.'+[sps[1],sps[2],sps[3]].map(x=>x.toString(16).padStart(2,'0')).join('')}}
 function toAvcc(u){const nals=splitNal(u).filter(n=>{const t=n[0]&31;return t!==7&&t!==8&&t!==9});let len=0;for(const n of nals)len+=4+n.length;const o=new Uint8Array(len);let p=0;for(const n of nals){o[p]=n.length>>24;o[p+1]=n.length>>16;o[p+2]=n.length>>8;o[p+3]=n.length;o.set(n,p+4);p+=4+n.length}return o}
 function drawH264(w,h,key,payload){if(!window.VideoDecoder)throw Error('H.264 needs Chromium');if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h}if(key){const cfg=avcCFromAnnexB(payload);if(cfg&&(!vdec||vdec.state==='closed'||avcc!==cfg.codec)){closeVdec();vdec=new VideoDecoder({output:f=>{ctx.drawImage(f,0,0,w,h);f.close()},error:e=>console.error(e)});avcc=cfg.codec;const data=toAvcc(payload);vdec.configure({codec:cfg.codec,codedWidth:w,codedHeight:h,description:cfg.desc,hardwareAcceleration:'prefer-hardware',optimizeForLatency:true}).then(()=>{if(vdec&&vdec.state==='configured'&&data.length)vdec.decode(new EncodedVideoChunk({type:'key',timestamp:(vts+=83333),data}))});return}}if(!vdec||vdec.state!=='configured')return;if(!key&&vdec.decodeQueueSize>2)return;const data=toAvcc(payload);if(!data.length)return;vdec.decode(new EncodedVideoChunk({type:key?'key':'delta',timestamp:(vts+=83333),data}))}
-function drawFrame(b){if(b.length<16||String.fromCharCode(b[0],b[1],b[2],b[3])!=='RPF1')throw Error('bad frame');let v=new DataView(b.buffer,b.byteOffset,b.byteLength),w=v.getUint32(4,true),h=v.getUint32(8,true);if(b[12]===2&&b[13]===2){closeVdec();if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h}createImageBitmap(new Blob([b.subarray(16)],{type:'image/jpeg'})).then(bmp=>{ctx.drawImage(bmp,0,0,w,h);bmp.close()}).catch(err=>{console.error(err);throw err});return}if(b[12]===3&&b[13]===3){drawH264(w,h,b[14]===1,b.subarray(16));return}if(b[12]!==1||b[13]!==1)throw Error('unsupported frame');throw Error('legacy zstd frames are no longer supported; update the agent')}
+function drawFrame(b){if(frameBusy){pendingFrame=b;return}frameBusy=true;try{if(b.length<16||String.fromCharCode(b[0],b[1],b[2],b[3])!=='RPF1')throw Error('bad frame');let v=new DataView(b.buffer,b.byteOffset,b.byteLength),w=v.getUint32(4,true),h=v.getUint32(8,true);if(b[12]===2&&b[13]===2){closeVdec();if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h}createImageBitmap(new Blob([b.subarray(16)],{type:'image/jpeg'})).then(bmp=>{ctx.drawImage(bmp,0,0,w,h);bmp.close();frameBusy=false;if(pendingFrame){const p=pendingFrame;pendingFrame=null;drawFrame(p)}}).catch(err=>{frameBusy=false;pendingFrame=null;console.error(err);throw err});return}if(b[12]===3&&b[13]===3){drawH264(w,h,b[14]===1,b.subarray(16));frameBusy=false;return}if(b[12]!==1||b[13]!==1)throw Error('unsupported frame');throw Error('legacy zstd frames are no longer supported; update the agent')}catch(e){frameBusy=false;pendingFrame=null;throw e}}
 function sendControl(o){if(sessionSocket&&sessionSocket.readyState===WebSocket.OPEN)sessionSocket.send(JSON.stringify(o))}
 function pos(e){let r=canvas.getBoundingClientRect();return{x:Math.max(0,Math.min(1,(e.clientX-r.left)/Math.max(1,r.width))),y:Math.max(0,Math.min(1,(e.clientY-r.top)/Math.max(1,r.height)))}}
-canvas.addEventListener('mousemove',e=>{let n=performance.now();if(n-lastMove<4)return;lastMove=n;let p=pos(e);sendControl({type:'mouse_move',data:{x_norm:p.x,y_norm:p.y}})});
+canvas.addEventListener('mousemove',e=>{let n=performance.now();if(n-lastMove<(shiftHeld?16:8))return;lastMove=n;let p=pos(e);sendControl({type:'mouse_move',data:{x_norm:p.x,y_norm:p.y}})});
 canvas.addEventListener('mousedown',e=>{e.preventDefault();canvas.focus();sendControl({type:'mouse_button',data:{button:e.button===2?'right':e.button===1?'middle':'left',down:true}})});
 canvas.addEventListener('mouseup',e=>{e.preventDefault();sendControl({type:'mouse_button',data:{button:e.button===2?'right':e.button===1?'middle':'left',down:false}})});
 canvas.addEventListener('contextmenu',e=>e.preventDefault());
@@ -1363,8 +1499,8 @@ canvas.addEventListener('keydown',e=>{let vk=vkFor(e);if(vk==null)return;e.preve
 canvas.addEventListener('keyup',e=>{let vk=vkFor(e);if(vk==null)return;e.preventDefault();sendControl({type:'key',data:{vk:vk,down:false}})});
 function vkFor(e){if(/^Key[A-Z]$/.test(e.code))return e.code.charCodeAt(3);if(/^Digit[0-9]$/.test(e.code))return e.code.charCodeAt(5);let m={Space:32,Enter:13,Tab:9,Backspace:8,Delete:46,Insert:45,ArrowLeft:37,ArrowUp:38,ArrowRight:39,ArrowDown:40,Home:36,End:35,PageUp:33,PageDown:34,ShiftLeft:16,ShiftRight:16,ControlLeft:17,ControlRight:17,AltLeft:18,AltRight:18,F1:112,F2:113,F3:114,F4:115,F5:116,F6:117,F7:118,F8:119,F9:120,F10:121,F11:122,F12:123};return m[e.code]??null}
 function toggleFullscreen(){let v=document.getElementById('viewer');if(!document.fullscreenElement)v.requestFullscreen?.();else document.exitFullscreen?.()}
-async function rotateEnroll(){if(!confirm('Rotate enrollment token?'))return;await A('/api/v1/admin/token/enroll',{method:'POST'});await boot()}
-async function rotateAdmin(){if(!confirm('Rotate admin token now?'))return;let x=await A('/api/v1/admin/token/admin',{method:'POST'});tok=x.token;sessionStorage.setItem('darktask_admin',tok);let e=document.getElementById('newadmin');e.textContent='NEW ADMIN TOKEN — save now: '+x.token;e.classList.remove('hidden')}
+async function rotateEnroll(){let x=await A('/api/v1/admin/token/enroll',{method:'POST',body:JSON.stringify({confirm:true})});await boot()}
+async function rotateAdmin(){let x=await A('/api/v1/admin/token/admin',{method:'POST',body:JSON.stringify({confirm:true})});tok=x.token;sessionStorage.setItem('darktask_admin',tok);let e=document.getElementById('newadmin');e.textContent='NEW ADMIN TOKEN — save now: '+x.token;e.classList.remove('hidden')}
 function copy(id){navigator.clipboard.writeText(document.getElementById(id).textContent)}
 function E(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function EA(s){return String(s??'').replace(/['\\]/g,'')}
 if(tok)A('/api/v1/admin/bootstrap').then(show).catch(logout)
