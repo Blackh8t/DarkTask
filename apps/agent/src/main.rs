@@ -167,6 +167,27 @@ fn program_data_dir() -> PathBuf {
         .join(APP_DIR)
 }
 
+fn agent_log(message: &str) {
+    use std::io::Write;
+
+    let line = format!("{message}\n");
+    let mut paths = vec![program_data_dir().join("agent.log")];
+    if let Some(temp) = std::env::var_os("TEMP") {
+        paths.push(PathBuf::from(temp).join("darktask-agent.log"));
+    }
+    paths.push(PathBuf::from(r"C:\Windows\Temp\darktask-agent.log"));
+
+    for path in paths {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = file.write_all(line.as_bytes());
+            break;
+        }
+    }
+}
+
 fn config_path() -> PathBuf {
     program_data_dir().join("agent-config.json")
 }
@@ -405,6 +426,16 @@ fn init_tracing(command: &Option<Command>) {
 
 #[cfg(windows)]
 fn main() -> Result<()> {
+    let result = main_impl();
+    if let Err(ref e) = result {
+        agent_log(&format!("agent exited with error: {e:#}"));
+    }
+    result
+}
+
+#[cfg(windows)]
+fn main_impl() -> Result<()> {
+    agent_log("agent starting");
     let cli = Cli::parse();
     init_tracing(&cli.command);
 
@@ -440,9 +471,28 @@ fn main() -> Result<()> {
 
 #[cfg(windows)]
 fn service_main(_arguments: Vec<OsString>) {
+    agent_log("service_main starting");
     if let Err(e) = run_windows_service() {
-        eprintln!("DarkTask service failed: {e:#}");
+        let msg = format!("DarkTask service failed: {e:#}");
+        agent_log(&msg);
+        eprintln!("{msg}");
     }
+}
+
+#[cfg(windows)]
+fn set_service_stopped(
+    status_handle: &service_control_handler::ServiceStatusHandle,
+    exit_code: ServiceExitCode,
+) {
+    let _ = status_handle.set_service_status(ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: ServiceState::Stopped,
+        controls_accepted: ServiceControlAccept::empty(),
+        exit_code,
+        checkpoint: 0,
+        wait_hint: Duration::default(),
+        process_id: None,
+    });
 }
 
 #[cfg(windows)]
@@ -470,12 +520,27 @@ fn run_windows_service() -> Result<()> {
         controls_accepted: ServiceControlAccept::empty(),
         exit_code: ServiceExitCode::Win32(0),
         checkpoint: 1,
-        wait_hint: Duration::from_secs(10),
+        wait_hint: Duration::from_secs(30),
         process_id: None,
     })?;
 
-    let config = read_config()?;
-    let identity = load_or_enroll(&config, false)?;
+    let config = match read_config() {
+        Ok(config) => config,
+        Err(e) => {
+            agent_log(&format!("read_config failed: {e:#}"));
+            set_service_stopped(&status_handle, ServiceExitCode::Win32(2));
+            return Err(e);
+        }
+    };
+
+    let identity = match load_or_enroll(&config, false) {
+        Ok(identity) => identity,
+        Err(e) => {
+            agent_log(&format!("load_or_enroll failed: {e:#}"));
+            set_service_stopped(&status_handle, ServiceExitCode::Win32(3));
+            return Err(e);
+        }
+    };
 
     status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,

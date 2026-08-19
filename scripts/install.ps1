@@ -149,6 +149,31 @@ function Publish-AgentBinary {
     throw "Could not replace $Destination."
 }
 
+function Test-AgentBinary {
+    param([Parameter(Mandatory = $true)][string]$Binary)
+
+    Unblock-File -Path $Binary -ErrorAction SilentlyContinue
+    $outFile = Join-Path $env:TEMP "darktask-agent-status.txt"
+    Remove-Item $outFile -Force -ErrorAction SilentlyContinue
+
+    $proc = Start-Process -FilePath "cmd.exe" `
+        -ArgumentList "/c", "`"$Binary`" status > `"$outFile`" 2>&1" `
+        -Wait -PassThru -NoNewWindow
+
+    if ($proc.ExitCode -eq -1073741515 -or $proc.ExitCode -eq 3221225781) {
+        throw @"
+remote-agent.exe cannot start on this PC (missing VC++ runtime DLL).
+Install Microsoft Visual C++ Redistributable (x64), then rerun install.ps1:
+  https://aka.ms/vs/17/release/vc_redist.x64.exe
+"@
+    }
+
+    if ($proc.ExitCode -ne 0) {
+        $details = Get-Content $outFile -ErrorAction SilentlyContinue
+        throw "remote-agent.exe preflight failed (exit $($proc.ExitCode)).`n$details"
+    }
+}
+
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 New-Item -ItemType Directory -Force -Path $ProgramDataDir | Out-Null
 icacls.exe $ProgramDataDir /grant "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" 2>$null | Out-Null
@@ -185,6 +210,7 @@ if ($latest.sha256) {
 }
 
 Publish-AgentBinary -Source $tempExe -Destination $Exe
+Unblock-File -Path $Exe -ErrorAction SilentlyContinue
 Remove-Item $tempExe -Force -ErrorAction SilentlyContinue
 Set-Content -Path $VersionFile -Value $latest.version -Encoding ASCII -NoNewline
 
@@ -211,6 +237,9 @@ if (Test-Path $Identity) {
 }
 
 Register-DeviceIdentity -IdentityPath $Identity -AgentVersion $latest.version
+
+Write-Host "Preflight agent binary ..."
+Test-AgentBinary -Binary $Exe
 
 Stop-DarkTaskAgent
 
