@@ -186,10 +186,14 @@ fn ws_url(server: &str, path: &str) -> String {
     format!("{}{}", base.trim_end_matches('/'), path)
 }
 
+fn strip_utf8_bom(raw: &[u8]) -> &[u8] {
+    raw.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(raw)
+}
+
 fn read_config() -> Result<AgentConfig> {
     let path = config_path();
     let raw = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-    Ok(serde_json::from_slice(&raw)?)
+    Ok(serde_json::from_slice(strip_utf8_bom(&raw))?)
 }
 
 fn load_or_enroll(config: &AgentConfig, reset_identity: bool) -> Result<Identity> {
@@ -200,7 +204,8 @@ fn load_or_enroll(config: &AgentConfig, reset_identity: bool) -> Result<Identity
     }
 
     if path.exists() {
-        return Ok(serde_json::from_slice(&fs::read(&path)?)?);
+        let raw = fs::read(&path)?;
+        return Ok(serde_json::from_slice(strip_utf8_bom(&raw))?);
     }
 
     let rt = tokio::runtime::Builder::new_current_thread()

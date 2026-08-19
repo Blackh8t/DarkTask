@@ -3,6 +3,7 @@
 **/*.exe
 .env
 .DS_Store
+PATH.txt
 apps/android_agent/.gradle/
 apps/android_agent/build/
 apps/android_agent/app/build/

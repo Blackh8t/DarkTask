@@ -595,7 +595,7 @@ async fn admin_bootstrap(
     let enrollment_token = current_enroll_token(&state);
     let install_ps1_url = format!("{server_url}/api/v1/admin/install.ps1");
     let install_command = format!(
-        r#"powershell -ExecutionPolicy Bypass -Command "& {{ $h=@{{Authorization='Bearer {admin}'}}; $p=Join-Path $env:TEMP 'darktask-install.ps1'; Invoke-WebRequest -Uri '{install_ps1_url}' -Headers $h -OutFile $p; & $p }}""#,
+        r#"$h=@{{Authorization='Bearer {admin}'}}; $p=Join-Path $env:TEMP 'darktask-install.ps1'; irm '{install_ps1_url}' -Headers $h -OutFile $p; & $p"#,
         admin = current_admin_token(&state),
         install_ps1_url = install_ps1_url,
     );
@@ -623,6 +623,17 @@ async fn admin_bootstrap(
     }))
 }
 
+fn install_ps1_template() -> String {
+    if let Ok(path) = std::env::var("REMOTE_INSTALL_PS1") {
+        match fs::read_to_string(&path) {
+            Ok(content) if !content.trim().is_empty() => return content,
+            Ok(_) => warn!(path = %path, "REMOTE_INSTALL_PS1 is empty; using embedded install.ps1"),
+            Err(e) => warn!(path = %path, error = %e, "REMOTE_INSTALL_PS1 unreadable; using embedded install.ps1"),
+        }
+    }
+    INSTALL_PS1_TEMPLATE.to_string()
+}
+
 async fn admin_install_ps1(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -630,7 +641,7 @@ async fn admin_install_ps1(
     require_admin(&headers, &state)?;
     let server_url = public_server_url(&headers);
     let enrollment_token = current_enroll_token(&state);
-    let script = INSTALL_PS1_TEMPLATE
+    let script = install_ps1_template()
         .replace("__DARKTASK_SERVER__", &server_url)
         .replace("__DARKTASK_ENROLL__", &enrollment_token);
     Ok(Response::builder()
@@ -1300,7 +1311,7 @@ const ACTIVE_IDLE_SECS=300;
 let deviceRefresh=null;
 const H=()=>({'Authorization':'Bearer '+tok,'Content-Type':'application/json'});
 async function A(path,opt={}){opt.headers={...(opt.headers||{}),...H()};let r=await fetch(path,opt),t=await r.text();if(r.status===401){logout();throw Error('Unauthorized')}if(!r.ok)throw Error(t||('HTTP '+r.status));return t?JSON.parse(t):{}}
-function loginInstallCmd(){const t=document.getElementById('token').value.trim()||'YOUR_ADMIN_TOKEN',url=location.origin+'/api/v1/admin/install.ps1';document.getElementById('login-installcmd').textContent=`powershell -ExecutionPolicy Bypass -Command "& { $h=@{Authorization='Bearer ${t}'}; $p=Join-Path $env:TEMP 'darktask-install.ps1'; irm '${url}' -Headers $h -OutFile $p; & $p }"`}
+function loginInstallCmd(){const t=document.getElementById('token').value.trim()||'YOUR_ADMIN_TOKEN',url=location.origin+'/api/v1/admin/install.ps1';document.getElementById('login-installcmd').textContent=`$h=@{Authorization='Bearer ${t}'}; $p=Join-Path $env:TEMP 'darktask-install.ps1'; irm '${url}' -Headers $h -OutFile $p; & $p`}
 document.getElementById('token').addEventListener('input',loginInstallCmd);
 loginInstallCmd();
 async function login(){tok=document.getElementById('token').value.trim();try{await A('/api/v1/admin/bootstrap');sessionStorage.setItem('darktask_admin',tok);show()}catch(e){let x=document.getElementById('err');x.textContent=e.message;x.classList.remove('hidden')}}
