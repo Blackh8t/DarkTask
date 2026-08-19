@@ -1424,7 +1424,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "remote-agent"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1445,7 +1445,7 @@ dependencies = [
 
 [[package]]
 name = "remote-controller"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1465,7 +1465,7 @@ dependencies = [
 
 [[package]]
 name = "remote-protocol"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "serde",
  "uuid",
@@ -1473,7 +1473,7 @@ dependencies = [
 
 [[package]]
 name = "remote-server"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "axum",
