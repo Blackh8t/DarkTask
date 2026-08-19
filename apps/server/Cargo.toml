@@ -20,4 +20,4 @@ uuid.workspace = true
 rusqlite.workspace = true
 sha2.workspace = true
 hex.workspace = true
-qrcode = { version = "0.14", default-features = false }
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
