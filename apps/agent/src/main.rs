@@ -4,8 +4,9 @@ use futures_util::{SinkExt, StreamExt};
 use remote_protocol::{
     AgentHello, AgentToServer, ControlMessage, EnrollRequest, EnrollResponse, Heartbeat,
     MouseButton, ServerToAgent, SessionMode, SessionPeek, SpecialAction,
-    DEFAULT_JPEG_QUALITY, DEFAULT_STREAM_FPS, FRAME_COMPRESS_JPEG, FRAME_HEADER_LEN,
-    FRAME_MAGIC, FRAME_PIXEL_JPEG, MAX_CAPTURE_WIDTH, MAX_STREAM_FPS,
+    DEFAULT_CAPTURE_MAX_WIDTH, DEFAULT_H264_BITRATE, DEFAULT_STREAM_FPS, FRAME_COMPRESS_H264,
+    FRAME_COMPRESS_JPEG, FRAME_HEADER_LEN, FRAME_H264_DELTA, FRAME_H264_KEY, FRAME_MAGIC,
+    FRAME_PIXEL_H264, FRAME_PIXEL_JPEG, MAX_CAPTURE_WIDTH, MAX_STREAM_FPS,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -23,7 +24,13 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 #[cfg(windows)]
-use jpeg_encoder::{ColorType, Encoder};
+use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, FrameType, UsageType};
+#[cfg(windows)]
+use openh264::formats::{BgraSliceU8, YUVBuffer};
+#[cfg(windows)]
+use openh264::OpenH264API;
+#[cfg(windows)]
+use jpeg_encoder::{ColorType, Encoder as JpegEncoder};
 
 #[cfg(windows)]
 use std::{ffi::{OsStr, OsString}, mem, os::windows::ffi::OsStrExt, ptr};
@@ -146,6 +153,10 @@ struct AgentConfig {
     enroll: String,
     #[serde(default = "default_fps")]
     max_fps: u16,
+    #[serde(default = "default_capture_max_width")]
+    capture_max_width: u32,
+    #[serde(default = "default_h264_bitrate")]
+    h264_bitrate: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,6 +166,22 @@ struct Identity {
 }
 
 fn default_fps() -> u16 { DEFAULT_STREAM_FPS }
+
+fn default_capture_max_width() -> u32 { DEFAULT_CAPTURE_MAX_WIDTH }
+
+fn default_h264_bitrate() -> u32 { DEFAULT_H264_BITRATE }
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            server: String::new(),
+            enroll: String::new(),
+            max_fps: default_fps(),
+            capture_max_width: default_capture_max_width(),
+            h264_bitrate: default_h264_bitrate(),
+        }
+    }
+}
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -385,6 +412,8 @@ fn show_status() -> Result<()> {
     if let Ok(config) = read_config() {
         println!("Server           : {}", config.server);
         println!("Max FPS          : {}", config.max_fps);
+        println!("Capture max width: {}", config.capture_max_width);
+        println!("H.264 bitrate    : {} bps", config.h264_bitrate);
         println!("Enroll token     : configured");
     }
 
@@ -444,7 +473,15 @@ fn main_impl() -> Result<()> {
 
     match cli.command.unwrap_or(Command::Service) {
         Command::Install { server, enroll, max_fps, start } => {
-            install_service(AgentConfig { server, enroll, max_fps }, start)
+            install_service(
+                AgentConfig {
+                    server,
+                    enroll,
+                    max_fps,
+                    ..Default::default()
+                },
+                start,
+            )
         }
 
         Command::Uninstall { purge } => uninstall_service(purge),
@@ -452,7 +489,12 @@ fn main_impl() -> Result<()> {
         Command::Status => show_status(),
 
         Command::Run { server, enroll, max_fps, reset_identity } => {
-            let config = AgentConfig { server, enroll, max_fps };
+            let config = AgentConfig {
+                server,
+                enroll,
+                max_fps,
+                ..Default::default()
+            };
             let identity = load_or_enroll(&config, reset_identity)?;
             let stop = Arc::new(AtomicBool::new(false));
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -810,13 +852,33 @@ fn quote_arg(s: &str) -> String {
 }
 
 #[cfg(windows)]
-fn scaled_capture_size(full_w: i32, full_h: i32) -> (i32, i32) {
-    if full_w <= MAX_CAPTURE_WIDTH as i32 {
-        return (full_w, full_h);
-    }
-    let out_w = MAX_CAPTURE_WIDTH as i32;
-    let out_h = ((full_h as i64 * out_w as i64) / full_w as i64).max(1) as i32;
-    (out_w, out_h)
+fn scaled_capture_size(full_w: i32, full_h: i32, max_width: u32) -> (i32, i32) {
+    let max_width = max_width.clamp(320, MAX_CAPTURE_WIDTH) as i32;
+    let (mut out_w, mut out_h) = if full_w <= max_width {
+        (full_w, full_h)
+    } else {
+        let out_w = max_width;
+        let out_h = ((full_h as i64 * out_w as i64) / full_w as i64).max(1) as i32;
+        (out_w, out_h)
+    };
+    // H.264 YUV420 requires even dimensions.
+    out_w &= !1;
+    out_h &= !1;
+    (out_w.max(2), out_h.max(2))
+}
+
+#[cfg(windows)]
+fn build_rpf1_h264(width: u32, height: u32, keyframe: bool, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
+    out.extend_from_slice(FRAME_MAGIC);
+    out.extend_from_slice(&width.to_le_bytes());
+    out.extend_from_slice(&height.to_le_bytes());
+    out.push(FRAME_PIXEL_H264);
+    out.push(FRAME_COMPRESS_H264);
+    out.push(if keyframe { FRAME_H264_KEY } else { FRAME_H264_DELTA });
+    out.push(0);
+    out.extend_from_slice(payload);
+    out
 }
 
 #[cfg(windows)]
@@ -977,21 +1039,39 @@ fn run_worker(
 }
 
 #[cfg(windows)]
+enum StreamCodec {
+    H264,
+    Jpeg,
+}
+
+#[cfg(windows)]
+struct StreamTuning {
+    max_fps: u16,
+    force_keyframe: bool,
+}
+
+#[cfg(windows)]
 struct FrameCapture {
     width: i32,
     height: i32,
+    capture_max_width: u32,
     screen: HDC,
     mem_dc: HDC,
     bitmap: HGDIOBJ,
     pixels: Vec<u8>,
-    jpeg_buf: Vec<u8>,
-    quality: u8,
     info: BITMAPINFO,
+    codec: StreamCodec,
+    h264_encoder: Option<Encoder>,
+    h264_buf: Vec<u8>,
+    jpeg_buf: Vec<u8>,
+    jpeg_quality: u8,
+    h264_bitrate: u32,
+    stream_max_fps: u16,
 }
 
 #[cfg(windows)]
 impl FrameCapture {
-    fn new(width: i32, height: i32) -> Result<Self> {
+    fn new(width: i32, height: i32, capture_max_width: u32, h264_bitrate: u32, max_fps: u16) -> Result<Self> {
         unsafe {
             let screen = GetDC(ptr::null_mut());
             if screen.is_null() {
@@ -1021,21 +1101,50 @@ impl FrameCapture {
             info.bmiHeader.biBitCount = 32;
             info.bmiHeader.biCompression = BI_RGB;
 
-            Ok(Self {
+            let mut capture = Self {
                 width,
                 height,
+                capture_max_width,
                 screen,
                 mem_dc,
                 bitmap,
                 pixels: vec![0u8; width as usize * height as usize * 4],
-                jpeg_buf: Vec::with_capacity(64 * 1024),
-                quality: DEFAULT_JPEG_QUALITY,
                 info,
-            })
+                codec: StreamCodec::H264,
+                h264_encoder: None,
+                h264_buf: Vec::with_capacity(64 * 1024),
+                jpeg_buf: Vec::with_capacity(64 * 1024),
+                jpeg_quality: 32,
+                h264_bitrate,
+                stream_max_fps: max_fps,
+            };
+            capture.init_h264_encoder(max_fps)?;
+            Ok(capture)
         }
     }
 
-    fn capture(&mut self) -> Result<Vec<u8>> {
+    fn init_h264_encoder(&mut self, max_fps: u16) -> Result<()> {
+        let config = EncoderConfig::new()
+            .usage_type(UsageType::ScreenContentRealTime)
+            .bitrate(BitRate::from_bps(self.h264_bitrate))
+            .max_frame_rate(FrameRate::from_hz(max_fps.max(1) as f32))
+            .skip_frames(true);
+        match Encoder::with_api_config(OpenH264API::from_source(), config) {
+            Ok(encoder) => {
+                self.codec = StreamCodec::H264;
+                self.h264_encoder = Some(encoder);
+                Ok(())
+            }
+            Err(e) => {
+                warn!(error=%e, "H.264 encoder init failed; falling back to JPEG");
+                self.codec = StreamCodec::Jpeg;
+                self.h264_encoder = None;
+                Ok(())
+            }
+        }
+    }
+
+    fn grab_pixels(&mut self) -> Result<()> {
         unsafe {
             let screen_w = GetSystemMetrics(SM_CXSCREEN);
             let screen_h = GetSystemMetrics(SM_CYSCREEN);
@@ -1043,9 +1152,16 @@ impl FrameCapture {
                 return Err(anyhow!("invalid desktop dimensions"));
             }
 
-            let (out_w, out_h) = scaled_capture_size(screen_w, screen_h);
+            let (out_w, out_h) =
+                scaled_capture_size(screen_w, screen_h, self.capture_max_width);
             if out_w != self.width || out_h != self.height {
-                *self = Self::new(out_w, out_h)?;
+                *self = Self::new(
+                    out_w,
+                    out_h,
+                    self.capture_max_width,
+                    self.h264_bitrate,
+                    self.stream_max_fps,
+                )?;
             }
 
             if StretchBlt(
@@ -1077,29 +1193,76 @@ impl FrameCapture {
             if rows == 0 {
                 return Err(anyhow!("GetDIBits failed"));
             }
-
-            self.jpeg_buf.clear();
-            let encoder = Encoder::new(&mut self.jpeg_buf, self.quality);
-            encoder
-                .encode(
-                    &self.pixels,
-                    self.width as u16,
-                    self.height as u16,
-                    ColorType::Bgra,
-                )
-                .map_err(|e| anyhow!("jpeg encode failed: {e}"))?;
-
-            let mut out = Vec::with_capacity(FRAME_HEADER_LEN + self.jpeg_buf.len());
-            out.extend_from_slice(FRAME_MAGIC);
-            out.extend_from_slice(&(self.width as u32).to_le_bytes());
-            out.extend_from_slice(&(self.height as u32).to_le_bytes());
-            out.push(FRAME_PIXEL_JPEG);
-            out.push(FRAME_COMPRESS_JPEG);
-            out.push(self.quality);
-            out.push(0);
-            out.extend_from_slice(&self.jpeg_buf);
-            Ok(out)
         }
+        Ok(())
+    }
+
+    fn capture_h264(&mut self, force_keyframe: bool) -> Result<Vec<u8>> {
+        let encoder = self
+            .h264_encoder
+            .as_mut()
+            .ok_or_else(|| anyhow!("H.264 encoder unavailable"))?;
+        if force_keyframe {
+            encoder.force_intra_frame();
+        }
+
+        let bgra = BgraSliceU8::new(&self.pixels, (self.width as usize, self.height as usize));
+        let yuv = YUVBuffer::from_rgb_source(bgra);
+        let stream = encoder
+            .encode(&yuv)
+            .map_err(|e| anyhow!("h264 encode failed: {e}"))?;
+
+        self.h264_buf.clear();
+        stream.write_vec(&mut self.h264_buf);
+        if self.h264_buf.is_empty() {
+            return Err(anyhow!("h264 encoder produced empty frame"));
+        }
+
+        let keyframe = matches!(stream.frame_type(), FrameType::IDR | FrameType::I);
+        Ok(build_rpf1_h264(
+            self.width as u32,
+            self.height as u32,
+            keyframe,
+            &self.h264_buf,
+        ))
+    }
+
+    fn capture_jpeg(&mut self) -> Result<Vec<u8>> {
+        self.jpeg_buf.clear();
+        let encoder = JpegEncoder::new(&mut self.jpeg_buf, self.jpeg_quality);
+        encoder
+            .encode(
+                &self.pixels,
+                self.width as u16,
+                self.height as u16,
+                ColorType::Bgra,
+            )
+            .map_err(|e| anyhow!("jpeg encode failed: {e}"))?;
+
+        let mut out = Vec::with_capacity(FRAME_HEADER_LEN + self.jpeg_buf.len());
+        out.extend_from_slice(FRAME_MAGIC);
+        out.extend_from_slice(&(self.width as u32).to_le_bytes());
+        out.extend_from_slice(&(self.height as u32).to_le_bytes());
+        out.push(FRAME_PIXEL_JPEG);
+        out.push(FRAME_COMPRESS_JPEG);
+        out.push(self.jpeg_quality);
+        out.push(0);
+        out.extend_from_slice(&self.jpeg_buf);
+        Ok(out)
+    }
+
+    fn capture(&mut self, tuning: &mut StreamTuning) -> Result<Vec<u8>> {
+        self.grab_pixels()?;
+        let force_keyframe = tuning.force_keyframe;
+        tuning.force_keyframe = false;
+        match self.codec {
+            StreamCodec::H264 => self.capture_h264(force_keyframe),
+            StreamCodec::Jpeg => self.capture_jpeg(),
+        }
+    }
+
+    fn apply_set_quality(&mut self, jpeg_quality: u8) {
+        self.jpeg_quality = jpeg_quality.clamp(20, 85);
     }
 }
 
@@ -1127,6 +1290,16 @@ async fn run_remote_session(
     session_token: String,
     max_fps: u16,
 ) -> Result<()> {
+    let stream_cfg = read_config().unwrap_or(AgentConfig {
+        server: server.clone(),
+        enroll: String::new(),
+        max_fps,
+        capture_max_width: DEFAULT_CAPTURE_MAX_WIDTH,
+        h264_bitrate: DEFAULT_H264_BITRATE,
+    });
+    let capture_max_width = stream_cfg.capture_max_width;
+    let h264_bitrate = stream_cfg.h264_bitrate;
+
     let url = ws_url(
         &server,
         &format!(
@@ -1142,15 +1315,26 @@ async fn run_remote_session(
     let (frame_tx, frame_rx) = watch::channel(Vec::new());
 
     let fps = max_fps.clamp(8, MAX_STREAM_FPS);
-    let mut ticker =
-        tokio::time::interval(Duration::from_millis(1000 / fps as u64));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let tuning = Arc::new(std::sync::Mutex::new(StreamTuning {
+        max_fps: fps,
+        force_keyframe: true,
+    }));
+    let tuning_for_control = tuning.clone();
 
     let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
     let height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-    let (cap_w, cap_h) = scaled_capture_size(width, height);
-    let capture = Arc::new(std::sync::Mutex::new(FrameCapture::new(cap_w, cap_h)?));
+    let (cap_w, cap_h) = scaled_capture_size(width, height, capture_max_width);
+    let capture = Arc::new(std::sync::Mutex::new(FrameCapture::new(
+        cap_w,
+        cap_h,
+        capture_max_width,
+        h264_bitrate,
+        fps,
+    )?));
     let capture_for_control = capture.clone();
+
+    let frame_delay = tokio::time::sleep(Duration::from_millis(1000 / fps as u64));
+    tokio::pin!(frame_delay);
 
     let send_task = tokio::spawn(async move {
         let mut frame_rx = frame_rx;
@@ -1180,7 +1364,7 @@ async fn run_remote_session(
                 match msg? {
                     Message::Text(text) => {
                         if let Ok(control) = serde_json::from_str::<ControlMessage>(&text) {
-                            apply_control(control, &capture_for_control)?;
+                            apply_control(control, &capture_for_control, &tuning_for_control)?;
                         }
                     }
                     Message::Close(_) => break,
@@ -1188,10 +1372,23 @@ async fn run_remote_session(
                 }
             }
 
-            _ = ticker.tick() => {
+            _ = &mut frame_delay => {
+                let interval_ms = {
+                    let t = tuning
+                        .lock()
+                        .map_err(|_| anyhow!("stream tuning lock poisoned"))?;
+                    1000 / t.max_fps.clamp(8, MAX_STREAM_FPS) as u64
+                };
+                frame_delay.as_mut().reset(
+                    tokio::time::Instant::now() + Duration::from_millis(interval_ms.max(1)),
+                );
+
                 let frame = {
                     let mut cap = capture.lock().map_err(|_| anyhow!("capture lock poisoned"))?;
-                    cap.capture()
+                    let mut tune = tuning
+                        .lock()
+                        .map_err(|_| anyhow!("stream tuning lock poisoned"))?;
+                    cap.capture(&mut tune)
                 };
                 match frame {
                     Ok(frame) => {
@@ -1211,6 +1408,7 @@ async fn run_remote_session(
 fn apply_control(
     msg: ControlMessage,
     capture: &Arc<std::sync::Mutex<FrameCapture>>,
+    tuning: &Arc<std::sync::Mutex<StreamTuning>>,
 ) -> Result<()> {
     unsafe {
         match msg {
@@ -1249,9 +1447,13 @@ fn apply_control(
                 keybd_event(vk as u8, 0, flags, 0);
             }
 
-            ControlMessage::SetQuality { jpeg_quality, .. } => {
+            ControlMessage::SetQuality { jpeg_quality, max_fps } => {
                 if let Ok(mut cap) = capture.lock() {
-                    cap.quality = jpeg_quality.clamp(20, 85);
+                    cap.apply_set_quality(jpeg_quality);
+                }
+                if let Ok(mut tune) = tuning.lock() {
+                    tune.max_fps = max_fps.clamp(8, MAX_STREAM_FPS);
+                    tune.force_keyframe = true;
                 }
             }
 

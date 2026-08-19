@@ -4,7 +4,7 @@ package com.darktask.agent
  * Encoder profile aligned with scrcpy's no-audio lightweight defaults
  * from https://github.com/nustato/scrcpy-remote-android
  *
- * Android uses MediaCodec H.264 (hardware). Windows stays JPEG.
+ * Android uses MediaCodec H.264 (hardware). Windows agent uses OpenH264 at 800px default.
  */
 object StreamConfig {
     const val MAX_SIZE = 1280

@@ -165,7 +165,9 @@ pub const FRAME_H264_KEY: u8 = 1;
 pub const DEFAULT_JPEG_QUALITY: u8 = 32;
 pub const DEFAULT_STREAM_FPS: u16 = 15;
 pub const MAX_STREAM_FPS: u16 = 20;
-/// Max capture width on Windows — downscale larger desktops for bandwidth.
-pub const MAX_CAPTURE_WIDTH: u32 = 1280;
+/// Default max capture width on Windows (viewer stretches to fit).
+pub const DEFAULT_CAPTURE_MAX_WIDTH: u32 = 800;
+/// Hard upper bound for capture width from config or control messages.
+pub const MAX_CAPTURE_WIDTH: u32 = 1920;
 /// Android H.264 target bitrate (no audio).
 pub const DEFAULT_H264_BITRATE: u32 = 1_000_000;

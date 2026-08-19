@@ -46,9 +46,11 @@ icacls.exe $ProgramDataDir /reset /T /C 2>$null | Out-Null
 
 Write-Host "=== Step 3: write config + enroll (UTF-8, no BOM) ==="
 $configJson = (@{
-    server  = $Server
-    enroll  = $EnrollToken
-    max_fps = 12
+    server            = $Server
+    enroll            = $EnrollToken
+    max_fps           = 12
+    capture_max_width = 800
+    h264_bitrate      = 1000000
 } | ConvertTo-Json -Compress)
 Write-Utf8NoBom -Path $Config -Value $configJson
 

@@ -1430,6 +1430,7 @@ dependencies = [
  "clap",
  "futures-util",
  "jpeg-encoder",
+ "openh264",
  "remote-protocol",
  "reqwest",
  "serde",

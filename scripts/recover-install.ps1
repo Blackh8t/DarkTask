@@ -56,7 +56,9 @@ if (-not (Test-Path $Config)) {
     $cfg = @{
         server  = $Server
         enroll  = $EnrollToken
-        max_fps = 12
+        max_fps           = 12
+        capture_max_width = 800
+        h264_bitrate      = 1000000
     }
 } else {
     $cfg = Get-Content $Config -Raw | ConvertFrom-Json

@@ -16,6 +16,12 @@ param(
     [int]$MaxFps = 15,
 
     [Parameter(Mandatory = $false)]
+    [int]$CaptureMaxWidth = 800,
+
+    [Parameter(Mandatory = $false)]
+    [int]$H264Bitrate = 1000000,
+
+    [Parameter(Mandatory = $false)]
     [switch]$SkipUpdateTask
 )
 
@@ -223,9 +229,11 @@ if (Test-Path $bundledMaint) {
 }
 
 $configJson = (@{
-    server  = $Server
-    enroll  = $EnrollToken
-    max_fps = $MaxFps
+    server            = $Server
+    enroll            = $EnrollToken
+    max_fps           = $MaxFps
+    capture_max_width = $CaptureMaxWidth
+    h264_bitrate      = $H264Bitrate
 } | ConvertTo-Json -Compress)
 Write-Utf8NoBom -Path $Config -Value $configJson
 
